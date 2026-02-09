@@ -1,0 +1,325 @@
+# =========================================================
+# STEP C — SPATIAL EVOLUTION INSIDE AOI (2005–2025 + pre/post 2015)
+# FULL SINGLE-BLOCK (COPIABLE) — 3-CLASS MODEL (0=Water,1=Veg/Macro,2=Sed)
+#
+# Exports (GeoTIFF to Google Drive):
+#  - MACRO_FREQ_2005_2025      (% of valid years as Veg/Macro)
+#  - MACRO_FREQ_PRE2015        (%)
+#  - MACRO_FREQ_POST2015       (%)
+#  - MACRO_FREQ_DIFF_POST_PRE  (pp)
+#
+# Optional:
+#  - Annual binary maps (Veg/Macro) per year
+#
+# REQUIREMENTS:
+#  - ee.Initialize(...) already done
+#  - AOI exists in memory as ee.Geometry (from your CandongaReservatorio.shp)
+#  - training samples CSV exists: /content/results/training_samples_3class.csv
+# =========================================================
+
+import os
+import ee
+import pandas as pd
+
+# -------------------------
+# HARD CHECKS
+# -------------------------
+if "AOI" not in globals():
+    raise NameError("AOI is not defined. Load your CandongaReservatorio AOI first (ee.Geometry).")
+
+try:
+    ee.Number(1).getInfo()
+except Exception as e:
+    raise RuntimeError("Earth Engine is not initialized. Run ee.Initialize(project=...) first.") from e
+
+# -------------------------
+# SETTINGS
+# -------------------------
+START_YEAR = 2005
+END_YEAR   = 2025
+EVENT_YEAR = 2015
+
+SCALE = 30
+MAX_PIX = 1e13
+
+# 3-class mapping (your training)
+CLASS_WATER = 0
+CLASS_VEG   = 1   # macrophytes/veg
+CLASS_SED   = 2
+
+EXPORT_FOLDER = "Candonga_Macrophytes"  # Drive folder
+EXPORT_ANNUAL_MAPS = False             # True = export 21 GeoTIFFs (one per year)
+
+# Quality controls
+MIN_VALID_FRAC_IMG   = 0.70   # per-image valid fraction inside AOI
+MIN_IMAGES_PER_YEAR  = 3      # require at least N images to compute that year’s map
+
+# Training samples (3-class) — produced by your Step A
+SAMPLES_CSV = "/content/results/training_samples_3class.csv"
+
+# RF parameters (match your best RF)
+RF_TREES = 200
+RF_MIN_LEAF = 2
+RF_SEED = 42
+
+# Features used by your 3-class model
+FEATURES = ["NDVI","MNDWI","BSI","NDMI","NBR2"]
+
+# -------------------------
+# LOAD TRAINING SAMPLES (CSV) AND TRAIN EE CLASSIFIER
+# -------------------------
+if not os.path.exists(SAMPLES_CSV):
+    raise FileNotFoundError(
+        f"Missing samples CSV: {SAMPLES_CSV}\n"
+        "Run the automatic sampling (3-class) first."
+    )
+
+df = pd.read_csv(SAMPLES_CSV)
+
+need_cols = FEATURES + ["class"]
+missing = [c for c in need_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Samples CSV missing columns: {missing}. Found: {list(df.columns)}")
+
+# Clean numeric
+for c in FEATURES + ["class"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+df = df.dropna(subset=need_cols).copy()
+df["class"] = df["class"].astype(int)
+
+# Keep only {0,1,2}
+df = df[df["class"].isin([0,1,2])].copy()
+
+# Balance classes (use min count)
+counts = df["class"].value_counts().to_dict()
+nmin = min(counts.get(0,0), counts.get(1,0), counts.get(2,0))
+if nmin < 50:
+    raise RuntimeError(f"Too few samples to train robustly. Class counts: {counts}")
+
+df_bal = pd.concat([
+    df[df["class"]==0].sample(n=nmin, random_state=123, replace=False),
+    df[df["class"]==1].sample(n=nmin, random_state=123, replace=False),
+    df[df["class"]==2].sample(n=nmin, random_state=123, replace=False),
+], ignore_index=True)
+
+print(f"📂 Loaded samples: {len(df)} | balanced: {len(df_bal)} (each class={nmin})")
+
+def df_to_ee_fc(df_in):
+    feats = []
+    for _, r in df_in.iterrows():
+        props = {k: float(r[k]) for k in FEATURES}
+        props["class"] = int(r["class"])
+        feats.append(ee.Feature(None, props))
+    return ee.FeatureCollection(feats)
+
+training_fc = df_to_ee_fc(df_bal)
+
+clf = ee.Classifier.smileRandomForest(
+    numberOfTrees=RF_TREES,
+    minLeafPopulation=RF_MIN_LEAF,
+    seed=RF_SEED
+).train(
+    features=training_fc,
+    classProperty="class",
+    inputProperties=FEATURES
+)
+
+print("✅ EE classifier trained: RandomForest (3-class, 5 features)")
+
+# -------------------------
+# LANDSAT PREPROCESS (C02 L2) + INDICES
+# -------------------------
+def mask_clouds(img):
+    qa = img.select("QA_PIXEL")
+    mask = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))  # cloud + shadow
+    return img.updateMask(mask)
+
+def scale_sr(img):
+    return (
+        img.select("SR_B.*")
+           .multiply(0.0000275)
+           .add(-0.2)
+           .copyProperties(img, ["system:time_start","SPACECRAFT_ID","system:id"])
+    )
+
+def harmonize(img):
+    sc = ee.String(img.get("SPACECRAFT_ID"))
+    sysid = ee.String(img.get("system:id"))
+
+    is89 = (
+        sc.index("LANDSAT_8").gte(0)
+        .Or(sc.index("LANDSAT_9").gte(0))
+        .Or(sysid.index("LC08").gte(0))
+        .Or(sysid.index("LC09").gte(0))
+    )
+
+    b57 = img.select(
+        ["SR_B1","SR_B2","SR_B3","SR_B4","SR_B5","SR_B7"],
+        ["BLUE","GREEN","RED","NIR","SWIR1","SWIR2"]
+    )
+    b89 = img.select(
+        ["SR_B2","SR_B3","SR_B4","SR_B5","SR_B6","SR_B7"],
+        ["BLUE","GREEN","RED","NIR","SWIR1","SWIR2"]
+    )
+
+    out = ee.Image(ee.Algorithms.If(is89, b89, b57))
+    return out.copyProperties(img, ["system:time_start","SPACECRAFT_ID","system:id"])
+
+def add_indices(img):
+    ndvi  = img.normalizedDifference(["NIR","RED"]).rename("NDVI")
+    mndwi = img.normalizedDifference(["GREEN","SWIR1"]).rename("MNDWI")
+    ndmi  = img.normalizedDifference(["NIR","SWIR1"]).rename("NDMI")
+    nbr2  = img.normalizedDifference(["SWIR1","SWIR2"]).rename("NBR2")
+    bsi   = img.expression(
+        "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))",
+        {"SWIR1": img.select("SWIR1"),
+         "RED":   img.select("RED"),
+         "NIR":   img.select("NIR"),
+         "BLUE":  img.select("BLUE")}
+    ).rename("BSI")
+    return img.addBands([ndvi,mndwi,bsi,ndmi,nbr2])
+
+def add_valid_frac(img):
+    frac = img.select("NDVI").mask().reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    ).get("NDVI")
+    return img.set("valid_frac", ee.Number(frac))
+
+def prep(col):
+    return (
+        col.filterBounds(AOI)
+           .map(mask_clouds)
+           .map(scale_sr)
+           .map(harmonize)
+           .map(add_indices)
+           .map(lambda im: im.clip(AOI))
+           .map(add_valid_frac)
+           .filter(ee.Filter.gte("valid_frac", MIN_VALID_FRAC_IMG))
+    )
+
+landsat = (
+    prep(ee.ImageCollection("LANDSAT/LT05/C02/T1_L2"))
+    .merge(prep(ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")))
+    .merge(prep(ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")))
+    .merge(prep(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")))
+)
+
+print(f"📡 QC Landsat images (all): {landsat.size().getInfo()}")
+
+# -------------------------
+# HELPERS: YEAR WINDOW + YEAR CLASSIFICATION
+# -------------------------
+def year_window(y):
+    return ee.Date.fromYMD(y, 1, 1), ee.Date.fromYMD(y+1, 1, 1)
+
+def classify_year_binary_macro(y):
+    """
+    Returns binary macro map for year y:
+      1 = class == VEG (macrophytes/veg)
+      0 = otherwise
+    Masked where invalid.
+    Only computed if year has >= MIN_IMAGES_PER_YEAR images after QC.
+    """
+    start, end = year_window(y)
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _do():
+        comp = col.median().clip(AOI)
+        # classify using full feature set
+        pred = comp.select(FEATURES).classify(clf).rename("class")
+        valid = comp.select("NDVI").mask()
+        macro = pred.eq(CLASS_VEG).And(valid).rename("macro")
+        return macro.updateMask(valid).set({"year": y, "n_images": n})
+
+    empty = ee.Image(0).rename("macro").updateMask(ee.Image(0)).set({"year": y, "n_images": n})
+    return ee.Image(ee.Algorithms.If(n.gte(MIN_IMAGES_PER_YEAR), _do(), empty))
+
+# -------------------------
+# EXPORT HELPER
+# -------------------------
+def export_geotiff(img, description, file_prefix):
+    task = ee.batch.Export.image.toDrive(
+        image=img,
+        description=description,
+        folder=EXPORT_FOLDER,
+        fileNamePrefix=file_prefix,
+        region=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    )
+    task.start()
+    print("Started export:", description)
+
+# -------------------------
+# BUILD ANNUAL COLLECTION (2005–2025)
+# -------------------------
+years = list(range(START_YEAR, END_YEAR + 1))
+annual_list = [classify_year_binary_macro(y) for y in years]
+annual_imgs = ee.ImageCollection(annual_list)
+
+print("Annual collection size:", annual_imgs.size().getInfo())
+print("Example year n_images:", annual_imgs.first().get("n_images").getInfo())
+
+# -------------------------
+# FREQUENCY MAPS
+# Mean(0/1) * 100 = % of (valid) years classified as macro.
+# Because years with insufficient images are fully masked, they do NOT bias the mean.
+# -------------------------
+freq_all  = annual_imgs.mean().multiply(100).rename("macro_freq_pct") \
+    .set({"start_year": START_YEAR, "end_year": END_YEAR, "min_images_per_year": MIN_IMAGES_PER_YEAR})
+
+pre_imgs  = annual_imgs.filter(ee.Filter.lt("year", EVENT_YEAR))
+post_imgs = annual_imgs.filter(ee.Filter.gte("year", EVENT_YEAR))
+
+freq_pre  = pre_imgs.mean().multiply(100).rename("macro_freq_pre_pct") \
+    .set({"period":"pre","start_year": START_YEAR, "end_year": EVENT_YEAR-1, "min_images_per_year": MIN_IMAGES_PER_YEAR})
+
+freq_post = post_imgs.mean().multiply(100).rename("macro_freq_post_pct") \
+    .set({"period":"post","start_year": EVENT_YEAR, "end_year": END_YEAR, "min_images_per_year": MIN_IMAGES_PER_YEAR})
+
+freq_diff = freq_post.subtract(freq_pre).rename("macro_freq_post_minus_pre_pct") \
+    .set({"event_year": EVENT_YEAR})
+
+# -------------------------
+# OPTIONAL: EXPORT ANNUAL MAPS
+# -------------------------
+if EXPORT_ANNUAL_MAPS:
+    for y in years:
+        im = classify_year_binary_macro(y).toByte()
+        export_geotiff(
+            img=im,
+            description=f"MACRO_BINARY_{y}",
+            file_prefix=f"macrophyte_binary_{y}"
+        )
+
+# -------------------------
+# EXPORT KEY PRODUCTS
+# -------------------------
+export_geotiff(freq_all,  f"MACRO_FREQ_{START_YEAR}_{END_YEAR}",            f"macrophyte_freq_{START_YEAR}_{END_YEAR}_pct")
+export_geotiff(freq_pre,  f"MACRO_FREQ_PRE{EVENT_YEAR}",                   f"macrophyte_freq_pre{EVENT_YEAR}_pct")
+export_geotiff(freq_post, f"MACRO_FREQ_POST{EVENT_YEAR}",                  f"macrophyte_freq_post{EVENT_YEAR}_pct")
+export_geotiff(freq_diff, f"MACRO_FREQ_DIFF_POST_MINUS_PRE_{EVENT_YEAR}",  f"macrophyte_freq_diff_post_minus_pre_{EVENT_YEAR}_pp")
+
+# -------------------------
+# QUICK AOI-WIDE SUMMARIES
+# -------------------------
+def mean_over_aoi(img, band):
+    d = img.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    )
+    return d.get(band)
+
+print("Mean freq all (%):",  mean_over_aoi(freq_all,  "macro_freq_pct").getInfo())
+print("Mean freq pre  (%):", mean_over_aoi(freq_pre,  "macro_freq_pre_pct").getInfo())
+print("Mean freq post (%):", mean_over_aoi(freq_post, "macro_freq_post_pct").getInfo())
+print("Mean diff (pp):",     mean_over_aoi(freq_diff, "macro_freq_post_minus_pre_pct").getInfo())
+
+print("\n✅ Spatial products queued for export to Google Drive folder:", EXPORT_FOLDER)
+print("➡️ Go to Earth Engine 'Tasks' tab and click RUN on each export.")
