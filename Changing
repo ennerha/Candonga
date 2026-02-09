@@ -1,0 +1,333 @@
+# =========================================================
+# STEP F — WHERE DID CHANGE OCCUR? (SHORELINE → CENTER + HOTSPOTS) — SINGLE BLOCK
+# Purpose (paper-ready):
+#   1) Build annual macrophyte binary maps (2005–2025) from your existing
+#      preprocessed Landsat collection + trained 3-class classifier (5 features).
+#   2) Compute frequency maps (pre vs post 2015) and the difference (post - pre).
+#   3) Convert frequency-difference into:
+#        - HOTSPOTS (strong increase) mask
+#        - COLDSPOTS (strong decrease) mask
+#   4) Quantify WHERE change occurred:
+#        - ring-by-ring (shoreline → center) summary of Δfrequency (pp)
+#        - hotspot/coldspot area (km²) per ring
+#        - global totals inside AOI
+#   5) Export key rasters (freq_pre, freq_post, diff, hotspots, coldspots) to Drive
+#      + save tables to /content/results for paper figures/tables.
+#
+# Requires in memory:
+#   AOI   : ee.Geometry
+#   landsat: ee.ImageCollection (preprocessed) WITH bands: NDVI,MNDWI,BSI,NDMI,NBR2 (and cloud-masked)
+#   clf   : ee.Classifier trained with FEATURES below
+#
+# Saves (local):
+#   /content/results/shoreline_center_change_rings_2005_2025.csv
+#   /content/results/shoreline_center_change_summary.json
+#
+# Exports to Drive folder (tasks):
+#   Candonga_Macrophytes/
+#     macro_freq_pre2005_2014_pct.tif
+#     macro_freq_post2015_2025_pct.tif
+#     macro_freq_diff_post_minus_pre_pp.tif
+#     macro_hotspots_increase_mask.tif
+#     macro_coldspots_decrease_mask.tif
+#
+# Notes:
+#   - "frequency" = % of years classified as macrophyte among valid pixels.
+#   - Δfrequency is in percentage points (pp).
+#   - Hotspot threshold default: +20 pp; Coldspot: -20 pp (tunable).
+# =========================================================
+
+import os, json
+import numpy as np
+import pandas as pd
+import ee
+
+# -------------------------
+# SETTINGS
+# -------------------------
+START_YEAR = 2005
+END_YEAR   = 2025
+EVENT_YEAR = 2015
+
+# Classifier inputs (MUST match your trained clf)
+FEATURES = ["NDVI", "MNDWI", "BSI", "NDMI", "NBR2"]
+MACRO_CLASS_VALUE = 1
+
+# Pixel / reduce settings
+SCALE = 30
+MAX_PIX = 1e13
+
+# Ring analysis
+RING_WIDTH_M = 60
+N_RINGS_MAX  = 25
+GEOM_ERR_M   = 10  # non-zero geometry maxError
+
+# Hotspot thresholds (Δfrequency in percentage points)
+HOTSPOT_PP = 20     # increase ≥ +20 pp
+COLDSPOT_PP = -20   # decrease ≤ -20 pp
+
+# Export
+EXPORT_FOLDER = "Candonga_Macrophytes"
+
+# Output files (local)
+OUT_DIR = "/content/results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+CSV_RINGS = f"{OUT_DIR}/shoreline_center_change_rings_2005_2025.csv"
+JSON_SUM  = f"{OUT_DIR}/shoreline_center_change_summary.json"
+
+# -------------------------
+# HARD CHECKS
+# -------------------------
+for v in ["AOI", "landsat", "clf"]:
+    if v not in globals():
+        raise NameError(f"Missing required variable: {v}")
+
+# Ensure Landsat actually contains all classifier bands
+try:
+    bnames = landsat.first().bandNames().getInfo()
+    missing_bands = [b for b in FEATURES if b not in bnames]
+    if missing_bands:
+        raise ValueError(
+            f"landsat is missing bands required by clf: {missing_bands}\n"
+            f"Found bands: {bnames}\n"
+            "Fix: use the same preprocessing from Step B (must add NDVI,MNDWI,BSI,NDMI,NBR2)."
+        )
+except Exception as e:
+    # don't hard fail if the collection is empty in the first() call,
+    # but in practice it should not be.
+    print("⚠ Could not verify bandNames from landsat.first(); continuing. Details:", str(e))
+
+# -------------------------
+# HELPERS
+# -------------------------
+def year_window(y):
+    return ee.Date.fromYMD(y, 1, 1), ee.Date.fromYMD(y + 1, 1, 1)
+
+def annual_macro_binary(y):
+    """
+    Annual binary macrophyte mask (1=macro) for the annual median composite.
+    Masked by valid pixels (cloud-masked).
+    """
+    start, end = year_window(y)
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _compute():
+        comp = col.median().clip(AOI)
+        # IMPORTANT: select all classifier inputs to avoid missing-band error
+        pred = comp.select(FEATURES).classify(clf).rename("class")
+        valid = comp.select("NDVI").mask()
+        macro = pred.eq(MACRO_CLASS_VALUE).And(valid).rename("macro")
+        return macro.updateMask(valid).set({
+            "year": y,
+            "n_images": n,
+            "system:time_start": start.millis()
+        })
+
+    empty = ee.Image(0).rename("macro").updateMask(ee.Image(0)).set({
+        "year": y,
+        "n_images": n,
+        "system:time_start": start.millis()
+    })
+
+    return ee.Image(ee.Algorithms.If(n.gt(0), _compute(), empty))
+
+def safe_buffer(geom, dist_m):
+    # non-zero error margin required
+    return geom.buffer(dist_m, GEOM_ERR_M)
+
+def build_rings(aoi):
+    """
+    Returns list of tuples:
+      (ring_id, ring_geom, m_from, m_to)
+    ring_id 0 is shoreline-adjacent; increasing ids move inward.
+    """
+    aoi_area = ee.Number(aoi.area(GEOM_ERR_M))
+    approx_r = aoi_area.divide(np.pi).sqrt()
+    max_inward = approx_r.multiply(0.9)
+
+    n_rings = max_inward.divide(RING_WIDTH_M).floor().min(N_RINGS_MAX)
+    n_rings_int = int(n_rings.getInfo())
+
+    if n_rings_int < 3:
+        raise RuntimeError(f"AOI too small for ring analysis at width={RING_WIDTH_M}m. Try 30m.")
+
+    rings = []
+    for i in range(n_rings_int):
+        d0 = -i * RING_WIDTH_M
+        d1 = -(i + 1) * RING_WIDTH_M
+
+        outer = safe_buffer(aoi, d0)
+        inner = safe_buffer(aoi, d1)
+        ring_geom = outer.difference(inner, GEOM_ERR_M)
+
+        rings.append((i, ring_geom, i * RING_WIDTH_M, (i + 1) * RING_WIDTH_M))
+
+    # Drop zero-area rings (client-side only once)
+    ring_areas = [ee.Number(g.area(GEOM_ERR_M)) for (_, g, _, _) in rings]
+    areas = ee.List(ring_areas).getInfo()
+
+    rings_ok = []
+    for rec, a in zip(rings, areas):
+        if a is not None and a > 0:
+            rings_ok.append(rec)
+
+    return rings_ok, float(aoi_area.getInfo()), float(approx_r.getInfo())
+
+def export_geotiff(img, description, file_prefix):
+    task = ee.batch.Export.image.toDrive(
+        image=img,
+        description=description,
+        folder=EXPORT_FOLDER,
+        fileNamePrefix=file_prefix,
+        region=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    )
+    task.start()
+    print("Started export:", description)
+
+def area_km2(mask_img, geom):
+    """Area (km²) where mask_img is 1 (masked elsewhere) inside geom."""
+    a = ee.Image.pixelArea().updateMask(mask_img).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=geom,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    ).get("area")
+    return ee.Number(a).divide(1e6)
+
+def mean_pp(img, geom, band):
+    """Mean of a band (pp) over geom."""
+    return img.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geom,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    ).get(band)
+
+# -------------------------
+# (1) Build annual macrophyte collection (server-side list)
+# -------------------------
+years_list = list(range(START_YEAR, END_YEAR + 1))
+annual = ee.ImageCollection([annual_macro_binary(y) for y in years_list])
+
+print("Annual images:", annual.size().getInfo())
+
+# -------------------------
+# (2) Frequency maps (% of years with macro)
+# -------------------------
+pre = annual.filter(ee.Filter.lt("year", EVENT_YEAR))    # 2005–2014
+post = annual.filter(ee.Filter.gte("year", EVENT_YEAR))  # 2015–2025
+
+freq_pre = pre.mean().multiply(100).rename("freq_pre_pct").set({
+    "start_year": START_YEAR,
+    "end_year": EVENT_YEAR - 1
+})
+
+freq_post = post.mean().multiply(100).rename("freq_post_pct").set({
+    "start_year": EVENT_YEAR,
+    "end_year": END_YEAR
+})
+
+diff_pp = freq_post.subtract(freq_pre).rename("diff_post_minus_pre_pp").set({
+    "event_year": EVENT_YEAR
+})
+
+# Hotspots / coldspots masks (binary 1 where condition holds)
+hotspots = diff_pp.gte(HOTSPOT_PP).selfMask().rename("hotspot_increase")
+coldspots = diff_pp.lte(COLDSPOT_PP).selfMask().rename("coldspot_decrease")
+
+# -------------------------
+# (3) Shoreline → center rings
+# -------------------------
+rings, aoi_area_m2, approx_r_m = build_rings(AOI)
+print(f"AOI area (m²): {aoi_area_m2:.0f}")
+print(f"Approx radius (m): {approx_r_m:.1f}")
+print(f"Rings: {len(rings)} | width={RING_WIDTH_M} m")
+
+# -------------------------
+# (4) Quantify Δfrequency + hotspot/coldspot area per ring
+#     (One getInfo per ring; small number of rings, OK.)
+# -------------------------
+rows = []
+for (rid, geom, r0, r1) in rings:
+    d_mean = mean_pp(diff_pp, geom, "diff_post_minus_pre_pp")
+    pre_mean = mean_pp(freq_pre, geom, "freq_pre_pct")
+    post_mean = mean_pp(freq_post, geom, "freq_post_pct")
+
+    hot_km2 = area_km2(hotspots, geom)
+    cold_km2 = area_km2(coldspots, geom)
+
+    # Bundle in ONE server evaluation per ring
+    info = ee.Dictionary({
+        "rid": rid,
+        "r0": r0,
+        "r1": r1,
+        "diff_mean_pp": d_mean,
+        "pre_mean_pct": pre_mean,
+        "post_mean_pct": post_mean,
+        "hotspot_km2": hot_km2,
+        "coldspot_km2": cold_km2
+    }).getInfo()
+
+    rows.append(info)
+
+df = pd.DataFrame(rows)
+df = df.sort_values("rid").rename(columns={
+    "rid": "ring_id",
+    "r0": "ring_m_from",
+    "r1": "ring_m_to"
+})
+
+# Save CSV
+df.to_csv(CSV_RINGS, index=False)
+print("✅ Saved ring change table:", CSV_RINGS)
+
+# -------------------------
+# (5) Global summaries (AOI-wide)
+# -------------------------
+summary = {
+    "START_YEAR": START_YEAR,
+    "END_YEAR": END_YEAR,
+    "EVENT_YEAR": EVENT_YEAR,
+    "RING_WIDTH_M": RING_WIDTH_M,
+    "N_RINGS_USED": int(len(rings)),
+    "HOTSPOT_PP": HOTSPOT_PP,
+    "COLDSPOT_PP": COLDSPOT_PP,
+}
+
+# AOI-wide mean frequencies and mean diff (pp)
+summary["AOI_mean_freq_pre_pct"] = float(mean_pp(freq_pre, AOI, "freq_pre_pct").getInfo())
+summary["AOI_mean_freq_post_pct"] = float(mean_pp(freq_post, AOI, "freq_post_pct").getInfo())
+summary["AOI_mean_diff_pp"] = float(mean_pp(diff_pp, AOI, "diff_post_minus_pre_pp").getInfo())
+
+# AOI-wide hotspot/coldspot area
+summary["AOI_hotspot_area_km2"] = float(area_km2(hotspots, AOI).getInfo())
+summary["AOI_coldspot_area_km2"] = float(area_km2(coldspots, AOI).getInfo())
+
+# Also report ring where Δ is highest (shoreline→center interpretation)
+if len(df):
+    rid_max = int(df.loc[df["diff_mean_pp"].astype(float).idxmax(), "ring_id"])
+    rid_min = int(df.loc[df["diff_mean_pp"].astype(float).idxmin(), "ring_id"])
+    summary["Ring_max_increase_id"] = rid_max
+    summary["Ring_min_change_id"] = rid_min
+
+with open(JSON_SUM, "w") as f:
+    json.dump(summary, f, indent=2)
+
+print("✅ Saved summary JSON:", JSON_SUM)
+print(summary)
+
+# -------------------------
+# (6) Export rasters to Drive (paper figures / GIS)
+# -------------------------
+export_geotiff(freq_pre,  "MACRO_FREQ_PRE2005_2014_PCT",  "macro_freq_pre2005_2014_pct")
+export_geotiff(freq_post, "MACRO_FREQ_POST2015_2025_PCT", "macro_freq_post2015_2025_pct")
+export_geotiff(diff_pp,   "MACRO_FREQ_DIFF_POST_MINUS_PRE_PP", "macro_freq_diff_post_minus_pre_pp")
+export_geotiff(hotspots,  "MACRO_HOTSPOTS_INCREASE_MASK", "macro_hotspots_increase_mask")
+export_geotiff(coldspots, "MACRO_COLDSPOTS_DECREASE_MASK", "macro_coldspots_decrease_mask")
+
+print("\n✅ Queued exports to Drive folder:", EXPORT_FOLDER)
+print("➡️ Open Earth Engine Tasks tab and click RUN on each export.")
