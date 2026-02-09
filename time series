@@ -1,0 +1,518 @@
+# =========================================================
+# STEP B — APPLY 3-CLASS RF (EE) TO TIME SERIES + JAN/2026
+# COMPLETE SINGLE-BLOCK — Candonga AOI
+#
+# Uses:
+#   - AOI (ee.Geometry) already defined (CandongaReservatorio.shp)
+#   - /content/results/training_samples_3class.csv  (NDVI,MNDWI,BSI,NDMI,NBR2,class)
+#
+# Does:
+#   1) Loads training_samples_3class.csv, cleans, balances classes
+#   2) Trains EE RandomForest (smileRandomForest) on 5 predictors
+#   3) Builds Landsat 5/7/8/9 C02 L2 collection with:
+#        cloud/shadow mask + scaling + harmonization + indices (NDVI,MNDWI,BSI,NDMI,NBR2)
+#   4) Computes annual stats for 2005–2025 + partial Jan/2026 (2026-01-01 to 2026-02-01)
+#        - water/veg/sed areas (m²) + % of valid AOI
+#   5) Resume-capable with state JSON
+#   6) Saves CSV + robustness summary + plot
+#
+# Outputs:
+#   /content/results/macrophyte_timeseries_3class_2005_2026.csv
+#   /content/results/macrophyte_timeseries_state_3class.json
+#   /content/results/timeseries_robustness_summary_3class.json
+#   /content/results/macrophyte_timeseries_plot_3class.png
+# =========================================================
+
+import os, json
+import numpy as np
+import pandas as pd
+import ee
+
+# Optional plotting + tests
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+try:
+    from scipy.stats import mannwhitneyu, spearmanr
+except Exception:
+    mannwhitneyu = None
+    spearmanr = None
+
+# -------------------------
+# Hard checks
+# -------------------------
+if "AOI" not in globals():
+    raise NameError("AOI is not defined. Build AOI from CandongaReservatorio.shp before running this block.")
+
+try:
+    ee.Number(1).getInfo()
+except Exception as e:
+    raise RuntimeError("Earth Engine is not initialized. Run ee.Initialize(project=...) first.") from e
+
+# -------------------------
+# Paths / Settings
+# -------------------------
+OUT_DIR = "/content/results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+SAMPLES_FILE = f"{OUT_DIR}/training_samples_3class.csv"
+
+TS_CSV   = f"{OUT_DIR}/macrophyte_timeseries_3class_2005_2026.csv"
+TS_STATE = f"{OUT_DIR}/macrophyte_timeseries_state_3class.json"
+ROBUST   = f"{OUT_DIR}/timeseries_robustness_summary_3class.json"
+PLOT_PNG = f"{OUT_DIR}/macrophyte_timeseries_plot_3class.png"
+
+YEAR_START = 2005
+YEAR_END   = 2026                 # include partial Jan/2026 as "period_id=2026-01"
+PARTIAL_2026_END = "2026-02-01"   # exclusive end (Jan 2026 only)
+EVENT_YEAR = 2015                 # Mariana
+
+# QC
+MIN_VALID_FRAC_IMG = 0.70         # same idea as before
+MIN_IMAGES_PER_YEAR_FULL = 3
+MIN_IMAGES_PARTIAL_2026 = 1       # Jan/2026 only
+
+# Class mapping (your definition)
+CLASS_WATER = 0
+CLASS_VEG   = 1   # macrophytes/veg
+CLASS_SED   = 2   # sediment/rejeito/banco
+
+FEATURES = ["NDVI","MNDWI","BSI","NDMI","NBR2"]
+
+# RF in EE (match your scikit choice conceptually)
+RF_TREES = 200
+RF_MIN_LEAF = 2
+RF_SEED = 42
+
+# -------------------------
+# Load training samples (3-class) and train EE RF
+# -------------------------
+if not os.path.exists(SAMPLES_FILE):
+    raise FileNotFoundError(f"Missing 3-class training samples: {SAMPLES_FILE}")
+
+print(f"📂 Loading 3-class samples: {SAMPLES_FILE}")
+df = pd.read_csv(SAMPLES_FILE)
+
+need_cols = FEATURES + ["class"]
+missing = [c for c in need_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Samples missing columns {missing}. Found: {list(df.columns)}")
+
+# numeric cleanup
+for c in FEATURES + ["class"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df = df.dropna(subset=need_cols).copy()
+df["class"] = df["class"].astype(int)
+df = df[df["class"].isin([CLASS_WATER, CLASS_VEG, CLASS_SED])].copy()
+
+# balance classes (avoid bias)
+counts = df["class"].value_counts().to_dict()
+print("✓ Samples after cleaning:", len(df), "| counts:", counts)
+
+nmin = min(counts.get(CLASS_WATER,0), counts.get(CLASS_VEG,0), counts.get(CLASS_SED,0))
+if nmin < 50:
+    raise RuntimeError(f"Too few samples to balance safely (min per class={nmin}). Re-run sampling to increase minority class.")
+
+df_bal = pd.concat([
+    df[df["class"]==CLASS_WATER].sample(n=nmin, random_state=123, replace=False),
+    df[df["class"]==CLASS_VEG  ].sample(n=nmin, random_state=123, replace=False),
+    df[df["class"]==CLASS_SED  ].sample(n=nmin, random_state=123, replace=False),
+], ignore_index=True)
+
+print(f"✓ Balanced samples used: {len(df_bal)} (each class={nmin})")
+
+def df_to_ee_fc(df_in):
+    feats = []
+    # Small-ish (708 rows typical) => ok to send client-side
+    for _, r in df_in.iterrows():
+        props = {k: float(r[k]) for k in FEATURES}
+        props["class"] = int(r["class"])
+        feats.append(ee.Feature(None, props))
+    return ee.FeatureCollection(feats)
+
+training_fc = df_to_ee_fc(df_bal)
+
+print("🔄 Training EE RandomForest...")
+clf = ee.Classifier.smileRandomForest(
+    numberOfTrees=RF_TREES,
+    minLeafPopulation=RF_MIN_LEAF,
+    seed=RF_SEED
+).train(
+    features=training_fc,
+    classProperty="class",
+    inputProperties=FEATURES
+)
+print("✅ Classifier ready: EE smileRandomForest (3-class, 5 features)")
+
+# -------------------------
+# Resume helpers
+# -------------------------
+def load_state(path):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {"done_periods": []}
+
+def save_state(path, s):
+    with open(path, "w") as f:
+        json.dump(s, f, indent=2)
+
+state = load_state(TS_STATE)
+done_periods = set(state.get("done_periods", []))
+
+def make_period_id(y):
+    return "2026-01" if y == 2026 else f"{y:04d}"
+
+# -------------------------
+# Landsat preprocess (C02 T1 L2)
+# -------------------------
+def mask_clouds(img):
+    qa = img.select("QA_PIXEL")
+    # bit 3 = cloud, bit 4 = cloud shadow (C02)
+    m = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
+    return img.updateMask(m)
+
+def scale_sr(img):
+    return (
+        img.select("SR_B.*")
+           .multiply(0.0000275)
+           .add(-0.2)
+           .copyProperties(img, ["system:time_start", "SPACECRAFT_ID", "system:id"])
+    )
+
+def harmonize(img):
+    sc = ee.String(img.get("SPACECRAFT_ID"))
+    sysid = ee.String(img.get("system:id"))
+
+    is89 = (
+        sc.index("LANDSAT_8").gte(0)
+        .Or(sc.index("LANDSAT_9").gte(0))
+        .Or(sysid.index("LC08").gte(0))
+        .Or(sysid.index("LC09").gte(0))
+    )
+
+    # L5/L7: B1,B2,B3,B4,B5,B7 -> BLUE,GREEN,RED,NIR,SWIR1,SWIR2
+    b57 = img.select(
+        ["SR_B1","SR_B2","SR_B3","SR_B4","SR_B5","SR_B7"],
+        ["BLUE","GREEN","RED","NIR","SWIR1","SWIR2"]
+    )
+
+    # L8/L9: B2,B3,B4,B5,B6,B7 -> BLUE,GREEN,RED,NIR,SWIR1,SWIR2
+    b89 = img.select(
+        ["SR_B2","SR_B3","SR_B4","SR_B5","SR_B6","SR_B7"],
+        ["BLUE","GREEN","RED","NIR","SWIR1","SWIR2"]
+    )
+
+    out = ee.Image(ee.Algorithms.If(is89, b89, b57))
+    return out.copyProperties(img, ["system:time_start", "SPACECRAFT_ID", "system:id"])
+
+def add_indices(img):
+    ndvi  = img.normalizedDifference(["NIR","RED"]).rename("NDVI")
+    mndwi = img.normalizedDifference(["GREEN","SWIR1"]).rename("MNDWI")
+    ndmi  = img.normalizedDifference(["NIR","SWIR1"]).rename("NDMI")
+    nbr2  = img.normalizedDifference(["SWIR1","SWIR2"]).rename("NBR2")
+    bsi   = img.expression(
+        "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))",
+        {
+            "SWIR1": img.select("SWIR1"),
+            "RED":   img.select("RED"),
+            "NIR":   img.select("NIR"),
+            "BLUE":  img.select("BLUE"),
+        }
+    ).rename("BSI")
+    return img.addBands([ndvi, mndwi, bsi, ndmi, nbr2])
+
+def add_valid_fraction(img):
+    # fraction of AOI with valid NDVI pixels
+    valid = img.select("NDVI").mask().rename("valid")
+    frac = valid.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=AOI,
+        scale=30,
+        maxPixels=1e13
+    ).get("valid")
+    return img.set("valid_frac", frac)
+
+def prep(col):
+    return (col.filterBounds(AOI)
+              .map(mask_clouds)
+              .map(scale_sr)
+              .map(harmonize)
+              .map(add_indices)
+              .map(lambda im: im.clip(AOI))
+              .map(add_valid_fraction)
+              .filter(ee.Filter.gte("valid_frac", MIN_VALID_FRAC_IMG)))
+
+landsat = (prep(ee.ImageCollection("LANDSAT/LT05/C02/T1_L2"))
+           .merge(prep(ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")))
+           .merge(prep(ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")))
+           .merge(prep(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))))
+
+print(f"📡 QC Landsat images (all): {landsat.size().getInfo()}")
+
+# -------------------------
+# Date windows (Jan/2026 partial)
+# -------------------------
+def date_window_for_year(y):
+    if y == 2026:
+        start = ee.Date("2026-01-01")
+        end   = ee.Date(PARTIAL_2026_END)   # exclusive end
+        min_images = MIN_IMAGES_PARTIAL_2026
+    else:
+        start = ee.Date.fromYMD(y, 1, 1)
+        end   = ee.Date.fromYMD(y + 1, 1, 1)
+        min_images = MIN_IMAGES_PER_YEAR_FULL
+    return start, end, min_images
+
+def compute_period_stats(y):
+    start, end, min_images = date_window_for_year(y)
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _compute():
+        comp = col.median().clip(AOI)
+        feats = comp.select(FEATURES)
+
+        classified = feats.classify(clf).rename("class")
+        valid_mask = comp.select("NDVI").mask()
+
+        pix_area = ee.Image.pixelArea().updateMask(valid_mask)
+
+        water_area = ee.Image.pixelArea().updateMask(classified.eq(CLASS_WATER).And(valid_mask))
+        veg_area   = ee.Image.pixelArea().updateMask(classified.eq(CLASS_VEG  ).And(valid_mask))
+        sed_area   = ee.Image.pixelArea().updateMask(classified.eq(CLASS_SED  ).And(valid_mask))
+
+        valid_sum = pix_area.reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=AOI, scale=30, maxPixels=1e13
+        ).get("area")
+
+        w_sum = water_area.reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=AOI, scale=30, maxPixels=1e13
+        ).get("area")
+
+        v_sum = veg_area.reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=AOI, scale=30, maxPixels=1e13
+        ).get("area")
+
+        s_sum = sed_area.reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=AOI, scale=30, maxPixels=1e13
+        ).get("area")
+
+        valid_n = ee.Number(valid_sum)
+        w_pct = ee.Number(w_sum).divide(valid_n).multiply(100)
+        v_pct = ee.Number(v_sum).divide(valid_n).multiply(100)
+        s_pct = ee.Number(s_sum).divide(valid_n).multiply(100)
+
+        valid_frac_comp = valid_mask.rename("valid").reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=AOI, scale=30, maxPixels=1e13
+        ).get("valid")
+
+        return ee.Dictionary({
+            "year": y,
+            "period_id": make_period_id(y),
+            "start": start.format("YYYY-MM-dd"),
+            "end": end.format("YYYY-MM-dd"),
+            "n_images": n,
+            "valid_area_m2": valid_sum,
+            "water_area_m2": w_sum,
+            "veg_area_m2": v_sum,
+            "sed_area_m2": s_sum,
+            "water_pct_valid": w_pct,
+            "veg_pct_valid": v_pct,     # << macrophytes/veg
+            "sed_pct_valid": s_pct,
+            "valid_frac_comp": valid_frac_comp
+        })
+
+    return ee.Dictionary(ee.Algorithms.If(
+        n.gte(min_images),
+        _compute(),
+        ee.Dictionary({
+            "year": y,
+            "period_id": make_period_id(y),
+            "start": start.format("YYYY-MM-dd"),
+            "end": end.format("YYYY-MM-dd"),
+            "n_images": n,
+            "valid_area_m2": None,
+            "water_area_m2": None,
+            "veg_area_m2": None,
+            "sed_area_m2": None,
+            "water_pct_valid": None,
+            "veg_pct_valid": None,
+            "sed_pct_valid": None,
+            "valid_frac_comp": None
+        })
+    ))
+
+# -------------------------
+# Resume CSV
+# -------------------------
+cols = [
+    "year","period_id","start","end","n_images",
+    "valid_area_m2","water_area_m2","veg_area_m2","sed_area_m2",
+    "water_pct_valid","veg_pct_valid","sed_pct_valid",
+    "valid_frac_comp"
+]
+
+if os.path.exists(TS_CSV):
+    df_out = pd.read_csv(TS_CSV)
+else:
+    df_out = pd.DataFrame(columns=cols)
+
+if "period_id" not in df_out.columns and "year" in df_out.columns:
+    df_out["period_id"] = df_out["year"].astype(str)
+
+seen = set(df_out["period_id"].astype(str).tolist()) if len(df_out) else set()
+
+print(f"\n🔄 Processing periods {YEAR_START}–{YEAR_END} (includes 2026-01) ...")
+print("=" * 100)
+
+for y in range(YEAR_START, YEAR_END + 1):
+    pid = make_period_id(y)
+
+    if (pid in done_periods) and (pid in seen):
+        print(f"Period {pid}: ✓ Already processed (skipping)")
+        continue
+
+    print(f"Period {pid}: Processing...", end=" ", flush=True)
+
+    info = compute_period_stats(y).getInfo()
+
+    row = {k: info.get(k) for k in cols}
+    # enforce numeric year
+    row["year"] = int(info.get("year"))
+
+    df_out = pd.concat([df_out, pd.DataFrame([row])], ignore_index=True)
+    df_out = df_out.drop_duplicates(subset=["period_id"]).sort_values(["year","period_id"])
+    df_out.to_csv(TS_CSV, index=False)
+
+    done_periods.add(pid)
+    state["done_periods"] = sorted(list(done_periods))
+    save_state(TS_STATE, state)
+
+    if row["veg_pct_valid"] is None:
+        print(f"⚠ n_imgs={row['n_images']} (insufficient data)")
+    else:
+        try:
+            print(f"✓ n_imgs={int(row['n_images'])}, veg(macro)={float(row['veg_pct_valid']):.2f}%, sed={float(row['sed_pct_valid']):.2f}%")
+        except Exception:
+            print(f"✓ done")
+
+print("=" * 100)
+print(f"✅ Time series saved: {TS_CSV}")
+print(f"✅ Resume state saved: {TS_STATE}")
+
+# -------------------------
+# Robustness diagnostics (full years only; Jan/2026 excluded from inferential stats)
+# -------------------------
+print("\n📊 Computing robustness statistics (veg/macro only; full years only for tests)...")
+
+df2 = pd.read_csv(TS_CSV).copy()
+
+for c in ["veg_pct_valid","sed_pct_valid","water_pct_valid","valid_area_m2","veg_area_m2","sed_area_m2","water_area_m2","valid_frac_comp"]:
+    if c in df2.columns:
+        df2[c] = pd.to_numeric(df2[c], errors="coerce")
+df2["n_images"] = pd.to_numeric(df2["n_images"], errors="coerce").fillna(0).astype(int)
+
+df_full = df2[df2["period_id"].astype(str).str.match(r"^\d{4}$")].copy()
+df_full["year"] = pd.to_numeric(df_full["year"], errors="coerce")
+
+pre  = df_full[(df_full["year"] < EVENT_YEAR) & df_full["veg_pct_valid"].notna()]
+post = df_full[(df_full["year"] >= EVENT_YEAR) & df_full["veg_pct_valid"].notna()]
+
+def cv_percent(x):
+    x = np.asarray(x, dtype=float)
+    if len(x) < 3 or np.nanmean(x) == 0:
+        return np.nan
+    return 100.0 * np.nanstd(x, ddof=1) / np.nanmean(x)
+
+pre_cv = cv_percent(pre["veg_pct_valid"].values) if len(pre) else np.nan
+
+rho_img, p_img = (np.nan, np.nan)
+if spearmanr is not None:
+    tmp = df_full[df_full["veg_pct_valid"].notna()].copy()
+    if len(tmp) >= 8:
+        rho_img, p_img = spearmanr(tmp["veg_pct_valid"], tmp["n_images"])
+
+mw_stat, mw_p = (np.nan, np.nan)
+if mannwhitneyu is not None and len(pre) >= 5 and len(post) >= 5:
+    mw = mannwhitneyu(pre["veg_pct_valid"], post["veg_pct_valid"], alternative="two-sided")
+    mw_stat, mw_p = float(mw.statistic), float(mw.pvalue)
+
+summary = {
+    "YEAR_START": YEAR_START,
+    "YEAR_END": YEAR_END,
+    "PARTIAL_2026_END": PARTIAL_2026_END,
+    "EVENT_YEAR": EVENT_YEAR,
+    "MIN_VALID_FRAC_IMG": MIN_VALID_FRAC_IMG,
+    "MIN_IMAGES_PER_YEAR_FULL": MIN_IMAGES_PER_YEAR_FULL,
+    "MIN_IMAGES_PARTIAL_2026": MIN_IMAGES_PARTIAL_2026,
+    "RF_TREES": RF_TREES,
+    "RF_MIN_LEAF": RF_MIN_LEAF,
+    "FEATURES": FEATURES,
+    "N_samples_balanced_total": int(len(df_bal)),
+    "Balanced_per_class": int(nmin),
+
+    "N_pre_years_used_full_years_only": int(len(pre)),
+    "N_post_years_used_full_years_only": int(len(post)),
+    "Pre_mean_veg_pct_full_years_only": float(pre["veg_pct_valid"].mean()) if len(pre) else None,
+    "Post_mean_veg_pct_full_years_only": float(post["veg_pct_valid"].mean()) if len(post) else None,
+    "Pre_CV_percent_full_years_only": float(pre_cv) if not np.isnan(pre_cv) else None,
+    "Spearman_rho_veg_vs_n_images_full_years_only": float(rho_img) if not np.isnan(rho_img) else None,
+    "Spearman_p_veg_vs_n_images_full_years_only": float(p_img) if not np.isnan(p_img) else None,
+    "MannWhitney_stat_veg_full_years_only": float(mw_stat) if not np.isnan(mw_stat) else None,
+    "MannWhitney_p_veg_full_years_only": float(mw_p) if not np.isnan(mw_p) else None,
+}
+
+with open(ROBUST, "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"✅ Robustness summary saved: {ROBUST}")
+print(summary)
+
+# -------------------------
+# Plot (2005..2025 + 2026-01 as 2026.08)
+# -------------------------
+if plt is not None:
+    dfp = df2[(df2["year"] >= YEAR_START)].copy()
+    dfp = dfp[dfp["veg_pct_valid"].notna()].copy()
+
+    def _sort_key(pid):
+        pid = str(pid)
+        if pid == "2026-01":
+            return 2026.0833
+        try:
+            return float(pid)
+        except Exception:
+            return np.nan
+
+    dfp["sort_key"] = dfp["period_id"].astype(str).map(_sort_key)
+    dfp = dfp.sort_values("sort_key")
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(dfp["sort_key"], dfp["veg_pct_valid"], marker="o", linewidth=2, label="Veg/Macrophytes (class 1)")
+    # also plot sediment (optional)
+    if "sed_pct_valid" in dfp.columns and dfp["sed_pct_valid"].notna().any():
+        plt.plot(dfp["sort_key"], dfp["sed_pct_valid"], marker="o", linewidth=2, label="Sediment (class 2)")
+
+    plt.axvline(EVENT_YEAR, linestyle="--", linewidth=2, color="red", label=f"Event year ({EVENT_YEAR})")
+    plt.xlabel("Year (Jan/2026 shown as 2026.08)")
+    plt.ylabel("% of valid AOI")
+    plt.title("Candonga — Annual Cover (Veg/Macrophytes vs Sediment) 2005–Jan 2026")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best")
+    plt.xlim(YEAR_START, 2026.20)
+    plt.tight_layout()
+    plt.savefig(PLOT_PNG, dpi=300, bbox_inches="tight")
+    print(f"✅ Plot saved: {PLOT_PNG}")
+else:
+    print("⚠ matplotlib not available; plot skipped.")
+
+print("\n✨ Done: 3-class time series through Jan/2026!")
+print("Saved:")
+print(" -", TS_CSV)
+print(" -", TS_STATE)
+print(" -", ROBUST)
+print(" -", PLOT_PNG)
