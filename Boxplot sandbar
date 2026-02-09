@@ -1,0 +1,656 @@
+# =========================================================
+# BOXPLOT SANDBAR — DRY SEASON ANALYSIS (AUG-SEP-OCT)
+# =========================================================
+# This code does EVERYTHING in a single block:
+#   1) Loads AOI from shapefile
+#   2) Filters Landsat scenes for dry season months (Aug, Sep, Oct)
+#   3) Automatic sampling of 3 classes (Water, Vegetation, Sediment)
+#   4) Trains RandomForest classifier in Earth Engine
+#   5) Processes Landsat 5/7/8/9 (2005-2025, dry season only)
+#   6) Exports per-scene table OR generates boxplot if CSV exists
+#
+# FIRST RUN: Exports data to Google Drive
+# SECOND RUN: Automatically generates boxplot
+# =========================================================
+
+import os, json, time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import geopandas as gpd
+import ee
+
+# =========================================================
+# 0) EARTH ENGINE INIT
+# =========================================================
+try:
+    ee.Number(1).getInfo()
+    print("✓ Earth Engine already initialized")
+except Exception:
+    ee.Initialize(project="ee-enneralcantara2")
+    print("✓ Earth Engine initialized")
+
+# =========================================================
+# 1) GLOBAL SETTINGS
+# =========================================================
+OUT_DIR = "/content/results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Input files
+AOI_SHP = "/content/drive/MyDrive/Candonga/CandongaReservatorio.shp"
+
+# Output files
+EXPORT_FOLDER = "Candonga_Macrophytes"
+CSV_NAME = "sandbar_scene_table_2005_2025_dry_season"
+CSV_DRIVE = f"/content/drive/MyDrive/{EXPORT_FOLDER}/{CSV_NAME}.csv"
+OUT_FIG = f"{OUT_DIR}/Figure_Boxplot_Sandbars_2005_2025_DRY_SEASON_500dpi.tif"
+SAMPLES_CSV = f"{OUT_DIR}/training_samples_3class_auto_dry_season.csv"
+STATE_JSON = f"{OUT_DIR}/boxplot_state_dry_season.json"
+
+# Temporal parameters
+START_YEAR = 2005
+END_YEAR   = 2025
+EVENT_YEAR = 2015
+
+# Dry season months (low water level)
+DRY_MONTHS = [8, 9, 10]  # August, September, October
+
+# Training window (pre-event for clean samples)
+TRAIN_START = "2005-01-01"
+TRAIN_END   = "2012-12-31"
+
+# Classes
+CLASS_WATER = 0
+CLASS_VEG   = 1
+CLASS_SEDIMENT = 2
+
+# Spectral features
+FEATURES = ["NDVI", "MNDWI", "BSI", "NDMI", "NBR2"]
+
+# Classifier parameters
+RF_TREES = 200
+RF_MIN_LEAF = 2
+RF_SEED = 42
+
+# Reduction parameters
+SCALE = 30
+MAX_PIX = 1e13
+TILE_SCALE = 4
+
+# QC
+MIN_VALID_FRAC_IMG = 0.70
+MIN_IMAGES_TRAIN = 3
+
+# Automatic sampling
+MIN_PER_CLASS = 120
+N_TARGET = 600
+OVERSAMPLE = 6
+BATCH_SIZE = 100
+
+# Thresholds for WATER
+W_MNDWI_MIN = 0.20
+W_NDVI_MAX = 0.10
+
+# Thresholds for VEGETATION
+V_NDVI_MIN = 0.35
+V_BSI_MAX = 0.15
+
+# Thresholds for SEDIMENT (will be auto-calibrated)
+S_BSI_MIN_FALLBACK = 0.03
+S_MNDWI_MAX_FALLBACK = -0.05
+
+# =========================================================
+# 2) LOAD AOI
+# =========================================================
+print("\n" + "="*80)
+print("STEP 1/6: LOADING AREA OF INTEREST")
+print("="*80)
+
+if not os.path.exists(AOI_SHP):
+    raise FileNotFoundError(f"Shapefile not found: {AOI_SHP}")
+
+gdf = gpd.read_file(AOI_SHP).to_crs("EPSG:4326")
+geom = gdf.geometry.union_all()
+AOI = ee.Geometry(geom.__geo_interface__)
+aoi_area = AOI.area(1).getInfo()
+
+print(f"✓ AOI loaded: {aoi_area:,.0f} m² ({aoi_area/1e6:.2f} km²)")
+
+# =========================================================
+# 3) LANDSAT PRE-PROCESSING (FUNCTIONS)
+# =========================================================
+print("\n" + "="*80)
+print("STEP 2/6: CONFIGURING LANDSAT PRE-PROCESSING")
+print("="*80)
+
+def mask_clouds(img):
+    qa = img.select("QA_PIXEL")
+    mask = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
+    return img.updateMask(mask)
+
+def scale_sr(img):
+    return (
+        img.select("SR_B.*")
+           .multiply(0.0000275)
+           .add(-0.2)
+           .copyProperties(img, ["system:time_start", "SPACECRAFT_ID", "system:id"])
+    )
+
+def harmonize(img):
+    sc = ee.String(img.get("SPACECRAFT_ID"))
+    sysid = ee.String(img.get("system:id"))
+    
+    is89 = (
+        sc.index("LANDSAT_8").gte(0)
+        .Or(sc.index("LANDSAT_9").gte(0))
+        .Or(sysid.index("LC08").gte(0))
+        .Or(sysid.index("LC09").gte(0))
+    )
+    
+    b57 = img.select(
+        ["SR_B1", "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B7"],
+        ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"]
+    )
+    
+    b89 = img.select(
+        ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"],
+        ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"]
+    )
+    
+    out = ee.Image(ee.Algorithms.If(is89, b89, b57))
+    return out.copyProperties(img, ["system:time_start", "SPACECRAFT_ID", "system:id"])
+
+def add_indices(img):
+    ndvi = img.normalizedDifference(["NIR", "RED"]).rename("NDVI")
+    mndwi = img.normalizedDifference(["GREEN", "SWIR1"]).rename("MNDWI")
+    ndmi = img.normalizedDifference(["NIR", "SWIR1"]).rename("NDMI")
+    nbr2 = img.normalizedDifference(["SWIR1", "SWIR2"]).rename("NBR2")
+    
+    bsi = img.expression(
+        "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))",
+        {
+            "SWIR1": img.select("SWIR1"),
+            "RED": img.select("RED"),
+            "NIR": img.select("NIR"),
+            "BLUE": img.select("BLUE")
+        }
+    ).rename("BSI")
+    
+    return img.addBands([ndvi, mndwi, bsi, ndmi, nbr2])
+
+def add_valid_fraction(img):
+    frac = img.select("NDVI").mask().reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    ).get("NDVI")
+    return img.set("valid_frac", ee.Number(frac))
+
+def filter_dry_season(img):
+    """Filter to keep only dry season months (Aug, Sep, Oct)"""
+    month = ee.Date(img.get("system:time_start")).get("month")
+    return img.set("month", month)
+
+def prep(col):
+    return (
+        col.filterBounds(AOI)
+           .map(mask_clouds)
+           .map(scale_sr)
+           .map(harmonize)
+           .map(add_indices)
+           .map(lambda im: im.clip(AOI))
+           .map(add_valid_fraction)
+           .map(filter_dry_season)
+           .filter(ee.Filter.inList("month", DRY_MONTHS))
+           .filter(ee.Filter.gte("valid_frac", MIN_VALID_FRAC_IMG))
+    )
+
+# Load all Landsat collections
+landsat = (
+    prep(ee.ImageCollection("LANDSAT/LT05/C02/T1_L2"))
+    .merge(prep(ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")))
+    .merge(prep(ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")))
+    .merge(prep(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")))
+)
+
+n_total = landsat.size().getInfo()
+print(f"✓ QC-approved Landsat images (dry season only): {n_total}")
+print(f"  Months included: August, September, October")
+
+# =========================================================
+# 4) AUTOMATIC SAMPLING (IF NOT EXISTS)
+# =========================================================
+print("\n" + "="*80)
+print("STEP 3/6: AUTOMATIC CLASS SAMPLING")
+print("="*80)
+
+if os.path.exists(SAMPLES_CSV):
+    print(f"✓ Samples already exist: {SAMPLES_CSV}")
+    df_samples = pd.read_csv(SAMPLES_CSV)
+    print(f"  Total: {len(df_samples)} samples")
+else:
+    print("⚠ Samples not found. Starting automatic sampling...")
+    
+    # Create training composite (pre-event, dry season only)
+    train_col = landsat.filterDate(TRAIN_START, TRAIN_END)
+    n_train = train_col.size().getInfo()
+    
+    if n_train < MIN_IMAGES_TRAIN:
+        raise RuntimeError(f"Too few training images: {n_train}")
+    
+    print(f"✓ Training images ({TRAIN_START} to {TRAIN_END}, dry season): {n_train}")
+    
+    train_img = train_col.median().clip(AOI)
+    
+    # Auto-calibrate sediment thresholds
+    print("  Calibrating sediment thresholds...")
+    
+    bsi_pct = train_img.select("BSI").reduceRegion(
+        reducer=ee.Reducer.percentile([70, 80, 90]),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    )
+    
+    mndwi_pct = train_img.select("MNDWI").reduceRegion(
+        reducer=ee.Reducer.percentile([70, 80, 90]),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    )
+    
+    bsi_p = bsi_pct.getInfo() or {}
+    mndwi_p = mndwi_pct.getInfo() or {}
+    
+    BSI_p80 = bsi_p.get("BSI_p80", S_BSI_MIN_FALLBACK)
+    M_p70 = mndwi_p.get("MNDWI_p70", S_MNDWI_MAX_FALLBACK)
+    
+    S_BSI_MIN = float(BSI_p80)
+    S_MNDWI_MAX = float(M_p70)
+    
+    print(f"  Thresholds: BSI > {S_BSI_MIN:.4f}, MNDWI < {S_MNDWI_MAX:.4f}")
+    
+    # Create masks
+    def build_masks(s_bsi_min, s_mndwi_max):
+        water = train_img.expression(
+            "(mndwi > a) && (ndvi < b)",
+            {
+                "mndwi": train_img.select("MNDWI"),
+                "ndvi": train_img.select("NDVI"),
+                "a": W_MNDWI_MIN,
+                "b": W_NDVI_MAX
+            }
+        )
+        
+        veg = train_img.expression(
+            "(ndvi > a) && (bsi < b)",
+            {
+                "ndvi": train_img.select("NDVI"),
+                "bsi": train_img.select("BSI"),
+                "a": V_NDVI_MIN,
+                "b": V_BSI_MAX
+            }
+        )
+        
+        sed = train_img.expression(
+            "(bsi > a) && (mndwi < b)",
+            {
+                "bsi": train_img.select("BSI"),
+                "mndwi": train_img.select("MNDWI"),
+                "a": s_bsi_min,
+                "b": s_mndwi_max
+            }
+        )
+        
+        return water, veg, sed
+    
+    def stratified_sample(img, mask, n_points, class_value, seed):
+        img_with_class = img.addBands(ee.Image.constant(class_value).rename("class"))
+        img_masked = img_with_class.updateMask(mask)
+        
+        samples = img_masked.stratifiedSample(
+            numPoints=n_points,
+            classBand="class",
+            region=AOI,
+            scale=SCALE,
+            seed=seed,
+            geometries=False
+        )
+        
+        return samples
+    
+    # Iterative relaxation
+    print("  Optimizing thresholds...")
+    
+    attempts = [
+        (1.00, 0.00),
+        (0.90, 0.00),
+        (0.80, 0.00),
+        (0.70, 0.00),
+        (0.70, 0.05),
+        (0.60, 0.05),
+        (0.50, 0.07),
+    ]
+    
+    best_samples = None
+    
+    for i, (mul, off) in enumerate(attempts, 1):
+        s_bsi = float(S_BSI_MIN * mul)
+        s_mnd = float(S_MNDWI_MAX + off)
+        
+        water_mask, veg_mask, sed_mask = build_masks(s_bsi, s_mnd)
+        
+        points_per_class = int(N_TARGET * OVERSAMPLE)
+        
+        try:
+            W = stratified_sample(train_img, water_mask, points_per_class, 0, 11)
+            V = stratified_sample(train_img, veg_mask, points_per_class, 1, 22)
+            S = stratified_sample(train_img, sed_mask, points_per_class, 2, 33)
+            
+            nW = W.size().getInfo()
+            nV = V.size().getInfo()
+            nS = S.size().getInfo()
+            
+            print(f"  Attempt {i}/{len(attempts)}: Water={nW}, Veg={nV}, Sed={nS}")
+            
+            if min(nW, nV, nS) >= MIN_PER_CLASS:
+                nmin = int(min(nW, nV, nS))
+                
+                W_limited = W.limit(nmin)
+                V_limited = V.limit(nmin)
+                S_limited = S.limit(nmin)
+                
+                best_samples = W_limited.merge(V_limited).merge(S_limited)
+                
+                print(f"  ✅ Thresholds accepted! {nmin} samples per class")
+                break
+                
+        except Exception as e:
+            print(f"  ⚠ Error in attempt {i}: {e}")
+            continue
+    
+    if best_samples is None:
+        raise RuntimeError("Could not obtain sufficient samples.")
+    
+    # Extract features in batches
+    print("  Extracting spectral features...")
+    
+    total_samples = best_samples.size().getInfo()
+    num_batches = (total_samples + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    print(f"  Total samples: {total_samples}")
+    print(f"  Number of batches: {num_batches}")
+    
+    all_dfs = []
+    
+    for batch_idx in range(num_batches):
+        start = batch_idx * BATCH_SIZE
+        
+        print(f"  Batch {batch_idx + 1}/{num_batches}...", end=" ", flush=True)
+        
+        batch_fc = ee.FeatureCollection(best_samples.toList(BATCH_SIZE, start))
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                batch_list = batch_fc.getInfo()["features"]
+                batch_data = []
+                
+                for feat in batch_list:
+                    props = feat["properties"]
+                    batch_data.append(props)
+                
+                batch_df = pd.DataFrame(batch_data)
+                
+                if len(batch_df) > 0:
+                    all_dfs.append(batch_df)
+                    print(f"✓ {len(batch_df)} samples")
+                break
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** (attempt + 1)
+                    print(f"⚠ Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"❌ Failed")
+                    raise
+        
+        if batch_idx < num_batches - 1:
+            time.sleep(1)
+    
+    # Combine and save
+    df_samples = pd.concat(all_dfs, ignore_index=True)
+    
+    required_cols = FEATURES + ["class"]
+    df_samples = df_samples.dropna(subset=required_cols).copy()
+    df_samples["class"] = df_samples["class"].astype(int)
+    
+    df_samples.to_csv(SAMPLES_CSV, index=False)
+    
+    print(f"\n✓ Samples saved: {SAMPLES_CSV}")
+    print(f"  Total: {len(df_samples)} samples")
+
+# =========================================================
+# 5) TRAIN CLASSIFIER
+# =========================================================
+print("\n" + "="*80)
+print("STEP 4/6: TRAINING CLASSIFIER")
+print("="*80)
+
+# Load and balance samples
+df = pd.read_csv(SAMPLES_CSV)
+
+for c in FEATURES + ["class"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df = df.dropna(subset=FEATURES + ["class"]).copy()
+df["class"] = df["class"].astype(int)
+df = df[df["class"].isin([0, 1, 2])].copy()
+
+counts = df["class"].value_counts().to_dict()
+nmin = min(counts.get(0, 0), counts.get(1, 0), counts.get(2, 0))
+
+if nmin < 50:
+    raise RuntimeError(f"Too few samples: {counts}")
+
+df_bal = pd.concat([
+    df[df["class"] == 0].sample(n=nmin, random_state=123, replace=False),
+    df[df["class"] == 1].sample(n=nmin, random_state=123, replace=False),
+    df[df["class"] == 2].sample(n=nmin, random_state=123, replace=False),
+], ignore_index=True)
+
+print(f"✓ Balanced samples: {len(df_bal)} ({nmin} per class)")
+
+# Convert to EE FeatureCollection
+def df_to_ee_fc(df_in):
+    feats = []
+    for _, r in df_in.iterrows():
+        props = {k: float(r[k]) for k in FEATURES}
+        props["class"] = int(r["class"])
+        feats.append(ee.Feature(None, props))
+    return ee.FeatureCollection(feats)
+
+training_fc = df_to_ee_fc(df_bal)
+
+# Train
+clf = ee.Classifier.smileRandomForest(
+    numberOfTrees=RF_TREES,
+    minLeafPopulation=RF_MIN_LEAF,
+    seed=RF_SEED
+).train(
+    features=training_fc,
+    classProperty="class",
+    inputProperties=FEATURES
+)
+
+print(f"✓ Classifier trained: RandomForest ({RF_TREES} trees)")
+
+# =========================================================
+# 6) CHECK IF CSV EXISTS → PLOT
+# =========================================================
+print("\n" + "="*80)
+print("STEP 5/6: CHECKING EXPORTED DATA")
+print("="*80)
+
+def plot_from_csv(csv_path):
+    print("\n" + "="*80)
+    print("STEP 6/6: GENERATING BOXPLOT")
+    print("="*80)
+    
+    df = pd.read_csv(csv_path)
+    
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype(int)
+    df["sandbar_km2"] = pd.to_numeric(df["sandbar_km2"], errors="coerce")
+    df = df.dropna(subset=["sandbar_km2"])
+    
+    years = list(range(START_YEAR, END_YEAR + 1))
+    data = [df[df.year == y]["sandbar_km2"].values for y in years]
+    
+    print("\nScenes per year:")
+    scenes_per_year = df.groupby("year").size()
+    print(scenes_per_year)
+    
+    # Plot
+    np.random.seed(42)
+    fig, ax = plt.subplots(figsize=(18, 7))
+    
+    # Boxplot
+    bp = ax.boxplot(
+        data,
+        labels=[str(y) for y in years],
+        widths=0.6,
+        showfliers=False,
+        patch_artist=True
+    )
+    
+    # Styling
+    for patch in bp['boxes']:
+        patch.set_facecolor('#D2691E')
+        patch.set_alpha(0.6)
+    
+    for whisker in bp['whiskers']:
+        whisker.set(color='#8B4513', linewidth=1.5)
+    
+    for cap in bp['caps']:
+        cap.set(color='#8B4513', linewidth=1.5)
+    
+    for median in bp['medians']:
+        median.set(color='red', linewidth=2)
+    
+    # Scatter
+    for i, y in enumerate(years, start=1):
+        vals = df[df.year == y]["sandbar_km2"].values
+        if len(vals):
+            x = np.random.normal(i, 0.06, len(vals))
+            ax.scatter(x, vals, s=20, alpha=0.5, color='#8B4513', edgecolors='none')
+    
+    # Event line
+    x_event = years.index(EVENT_YEAR) + 1
+    ax.axvline(x_event, color="red", linestyle="--", linewidth=2.5,
+               label=f"Mariana Disaster ({EVENT_YEAR})", zorder=10)
+    
+    ax.set_title(
+        "Candonga Reservoir — Annual distribution of SANDBAR area per Landsat scene\n(Dry Season: August, September, October)",
+        fontsize=17, fontweight="bold", pad=20
+    )
+    ax.set_xlabel("Year", fontsize=15, fontweight="bold")
+    ax.set_ylabel("Sandbar area (km²)", fontsize=15, fontweight="bold")
+    ax.grid(axis="y", alpha=0.3, linestyle='--', linewidth=0.8)
+    ax.legend(fontsize=13, loc='upper left', framealpha=0.9)
+    
+    plt.tight_layout()
+    plt.savefig(OUT_FIG, dpi=500, bbox_inches="tight")
+    plt.close()
+    
+    print(f"\n✅ FIGURE SAVED (500 dpi):")
+    print(f"   {OUT_FIG}")
+    
+    # Statistics
+    print("\n" + "="*80)
+    print("📊 SUMMARY STATISTICS (DRY SEASON: AUG-SEP-OCT)")
+    print("="*80)
+    print(f"Total scenes: {len(df)}")
+    print(f"Overall mean: {df['sandbar_km2'].mean():.4f} km²")
+    print(f"Overall median: {df['sandbar_km2'].median():.4f} km²")
+    print(f"Standard deviation: {df['sandbar_km2'].std():.4f} km²")
+    print(f"Minimum: {df['sandbar_km2'].min():.4f} km²")
+    print(f"Maximum: {df['sandbar_km2'].max():.4f} km²")
+    
+    # Pre/post event comparison
+    pre = df[df.year < EVENT_YEAR]["sandbar_km2"]
+    post = df[df.year >= EVENT_YEAR]["sandbar_km2"]
+    
+    if len(pre) > 0 and len(post) > 0:
+        print(f"\nPre-{EVENT_YEAR} (mean): {pre.mean():.4f} km²")
+        print(f"Post-{EVENT_YEAR} (mean): {post.mean():.4f} km²")
+        print(f"Change: {((post.mean() - pre.mean()) / pre.mean() * 100):+.1f}%")
+
+if os.path.exists(CSV_DRIVE):
+    print(f"✓ CSV found: {CSV_DRIVE}")
+    plot_from_csv(CSV_DRIVE)
+    print("\n" + "="*80)
+    print("✨ PROCESSING COMPLETED SUCCESSFULLY!")
+    print("="*80)
+    raise SystemExit(0)
+
+# =========================================================
+# 7) EXPORT DATA
+# =========================================================
+print("⚠ CSV not found. Starting export...")
+
+def per_image_sandbar(img):
+    pred = img.select(FEATURES).classify(clf)
+    valid = img.select("NDVI").mask()
+    
+    sand = pred.eq(CLASS_SEDIMENT).And(valid)
+    area = ee.Image.pixelArea().updateMask(sand)
+    
+    sand_m2 = area.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX,
+        tileScale=TILE_SCALE
+    ).get("area")
+    
+    year = ee.Date(img.get("system:time_start")).get("year")
+    
+    return ee.Feature(None, {
+        "year": year,
+        "sandbar_km2": ee.Number(sand_m2).divide(1e6)
+    })
+
+fc = ee.FeatureCollection(
+    landsat
+    .filterDate(f"{START_YEAR}-01-01", f"{END_YEAR+1}-01-01")
+    .map(per_image_sandbar)
+)
+
+task = ee.batch.Export.table.toDrive(
+    collection=fc,
+    description=f"SANDBAR_DRY_SEASON_{START_YEAR}_{END_YEAR}",
+    folder=EXPORT_FOLDER,
+    fileNamePrefix=CSV_NAME,
+    fileFormat="CSV"
+)
+task.start()
+
+print("\n" + "="*80)
+print("✅ EXPORT STARTED!")
+print("="*80)
+print(f"Description: SANDBAR_DRY_SEASON_{START_YEAR}_{END_YEAR}")
+print(f"Drive folder: {EXPORT_FOLDER}")
+print(f"File: {CSV_NAME}.csv")
+print(f"Path: {CSV_DRIVE}")
+print(f"Season filter: August, September, October (dry season)")
+
+print("\n" + "="*80)
+print("📋 NEXT STEPS:")
+print("="*80)
+print("1. Go to: Earth Engine → Tasks")
+print("2. Click RUN on the export task")
+print("3. Wait for completion (5-15 minutes)")
+print("4. RUN THIS CODE AGAIN to generate the boxplot")
+print("="*80)
