@@ -1,0 +1,591 @@
+# =========================================================
+# TREINAMENTO AUTOMÁTICO — 3 CLASSES (AOI Candonga) 
+# VERSÃO COMPLETA E CORRIGIDA - FIX AMOSTRAGEM
+# =========================================================
+# Classes:
+#   0 = Água
+#   1 = Vegetação/Macrófitas
+#   2 = Sedimento/Rejeitos/Bancos de areia (expostos)
+#
+# Correção crítica: Amostragem direta da imagem com coordenadas
+# =========================================================
+
+from google.colab import drive
+drive.mount("/content/drive", force_remount=False)
+
+import os, json, time
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import ee
+import geemap
+
+print("=" * 70)
+print("TREINAMENTO AUTOMÁTICO - 3 CLASSES")
+print("=" * 70)
+
+# =========================================================================
+# CONFIGURAÇÕES
+# =========================================================================
+
+EE_PROJECT = "ee-enneralcantara2"
+
+# Caminho do shapefile da AOI
+SHP = "/content/drive/MyDrive/Candonga/CandongaReservatorio.shp"
+
+# Diretório de saída
+OUT_DIR = "/content/results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Arquivos de saída
+STATE_JSON  = f"{OUT_DIR}/auto_train_state_3class.json"
+SAMPLES_CSV = f"{OUT_DIR}/training_samples_3class.csv"
+THR_JSON    = f"{OUT_DIR}/thresholds_3class.json"
+
+# Janela temporal de treinamento (pré-evento)
+TRAIN_START = "2005-01-01"
+TRAIN_END   = "2012-12-31"
+
+# Controle de qualidade (apenas treinamento)
+MIN_VALID_FRAC = 0.50
+
+# Alvos de amostragem
+MIN_PER_CLASS = 120
+N_TARGET      = 600
+OVERSAMPLE    = 6
+BATCH_SIZE    = 100  # REDUZIDO para maior confiabilidade
+
+# Limiares para ÁGUA (conservadores)
+W_MNDWI_MIN = 0.20
+W_NDVI_MAX  = 0.10
+
+# Limiares para VEGETAÇÃO (moderadamente relaxados)
+V_NDVI_MIN = 0.35
+V_BSI_MAX  = 0.15
+
+# Limiares para SEDIMENTO (serão auto-calibrados)
+S_BSI_MIN_FALLBACK   = 0.03
+S_MNDWI_MAX_FALLBACK = -0.05
+
+# Features espectrais a extrair
+FEATURES = ["NDVI", "MNDWI", "BSI", "NDMI", "NBR2"]
+
+# =========================================================================
+# FUNÇÕES DE ESTADO
+# =========================================================================
+
+def load_state():
+    if os.path.exists(STATE_JSON):
+        with open(STATE_JSON, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_state(s):
+    with open(STATE_JSON, "w") as f:
+        json.dump(s, f, indent=2)
+
+state = load_state()
+
+# =========================================================================
+# INICIALIZAÇÃO DO EARTH ENGINE
+# =========================================================================
+
+def ee_init(project):
+    try:
+        ee.Initialize(project=project)
+        ee.Number(1).getInfo()
+        print(f"✓ Earth Engine inicializado: {project}")
+        return
+    except Exception as e:
+        print(f"Inicialização direta falhou: {e}")
+        print("Tentando via geemap...")
+    
+    geemap.ee_initialize(project=project)
+    ee.Number(1).getInfo()
+    print(f"✓ Earth Engine inicializado via geemap: {project}")
+
+ee_init(EE_PROJECT)
+
+# =========================================================================
+# CARREGAR ÁREA DE INTERESSE
+# =========================================================================
+
+print("\n" + "-" * 70)
+print("CARREGANDO ÁREA DE INTERESSE")
+print("-" * 70)
+
+if not os.path.exists(SHP):
+    raise FileNotFoundError(f"Shapefile não encontrado: {SHP}")
+
+gdf = gpd.read_file(SHP).to_crs("EPSG:4326")
+if len(gdf) == 0:
+    raise RuntimeError("Shapefile carregado mas não contém features.")
+
+geom = gdf.geometry.union_all()
+AOI = geemap.geopandas_to_ee(
+    gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
+).geometry()
+
+aoi_area = ee.Number(AOI.area(1)).getInfo()
+print(f"✓ Área da AOI: {aoi_area:,.0f} m²")
+print(f"✓ Área da AOI: {aoi_area/1e6:.2f} km²")
+
+# =========================================================================
+# PRÉ-PROCESSAMENTO LANDSAT
+# =========================================================================
+
+print("\n" + "-" * 70)
+print("CONFIGURANDO PRÉ-PROCESSAMENTO LANDSAT")
+print("-" * 70)
+
+def mask_clouds(img):
+    qa = img.select("QA_PIXEL")
+    mask = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
+    return img.updateMask(mask)
+
+def scale(img):
+    return (
+        img.select("SR_B.*")
+           .multiply(0.0000275)
+           .add(-0.2)
+           .copyProperties(img, ["system:time_start", "SPACECRAFT_ID", "system:id"])
+    )
+
+def harmonize(img):
+    sc = ee.String(img.get("SPACECRAFT_ID"))
+    sysid = ee.String(img.get("system:id"))
+
+    is89 = (
+        sc.index("LANDSAT_8").gte(0)
+        .Or(sc.index("LANDSAT_9").gte(0))
+        .Or(sysid.index("LC08").gte(0))
+        .Or(sysid.index("LC09").gte(0))
+    )
+
+    b57 = img.select(
+        ["SR_B1", "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B7"],
+        ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"]
+    )
+
+    b89 = img.select(
+        ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"],
+        ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"]
+    )
+
+    out = ee.Image(ee.Algorithms.If(is89, b89, b57))
+    return out.copyProperties(img, ["system:time_start", "SPACECRAFT_ID", "system:id"])
+
+def add_indices(img):
+    ndvi = img.normalizedDifference(["NIR", "RED"]).rename("NDVI")
+    mndwi = img.normalizedDifference(["GREEN", "SWIR1"]).rename("MNDWI")
+    ndmi = img.normalizedDifference(["NIR", "SWIR1"]).rename("NDMI")
+    nbr2 = img.normalizedDifference(["SWIR1", "SWIR2"]).rename("NBR2")
+    bsi = img.expression(
+        "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))",
+        {
+            "SWIR1": img.select("SWIR1"),
+            "RED":   img.select("RED"),
+            "NIR":   img.select("NIR"),
+            "BLUE":  img.select("BLUE")
+        }
+    ).rename("BSI")
+    
+    return img.addBands([ndvi, mndwi, bsi, ndmi, nbr2])
+
+def add_valid_fraction(img):
+    frac = img.select("NDVI").mask().reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=AOI,
+        scale=30,
+        maxPixels=1e13
+    ).get("NDVI")
+    return img.set("valid_frac", ee.Number(frac))
+
+def prep(col):
+    return (
+        col.filterBounds(AOI)
+           .map(mask_clouds)
+           .map(scale)
+           .map(harmonize)
+           .map(add_indices)
+           .map(lambda i: i.clip(AOI))
+           .map(add_valid_fraction)
+           .filter(ee.Filter.gte("valid_frac", MIN_VALID_FRAC))
+    )
+
+landsat = (
+    prep(ee.ImageCollection("LANDSAT/LT05/C02/T1_L2"))
+    .merge(prep(ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")))
+    .merge(prep(ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")))
+    .merge(prep(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")))
+)
+
+train_col = landsat.filterDate(TRAIN_START, TRAIN_END)
+n_train = train_col.size().getInfo()
+
+print(f"✓ Imagens com QC aprovado (treinamento): {n_train}")
+
+if n_train == 0:
+    raise RuntimeError("Nenhuma imagem encontrada no período de treinamento.")
+
+print("✓ Criando composição mediana...")
+train_img = train_col.median().select(FEATURES).clip(AOI)
+print(f"✓ Bandas disponíveis: {train_img.bandNames().getInfo()}")
+
+# =========================================================================
+# CHECKPOINT
+# =========================================================================
+
+print("\n" + "-" * 70)
+print("VERIFICANDO CHECKPOINT")
+print("-" * 70)
+
+if os.path.exists(SAMPLES_CSV) and state.get("samples_saved", False):
+    df = pd.read_csv(SAMPLES_CSV)
+    print(f"✅ Amostras já existentes carregadas: {SAMPLES_CSV}")
+    print(f"   Total de linhas: {len(df)}")
+    print(f"   Distribuição de classes:")
+    for cls, count in sorted(df["class"].value_counts().items()):
+        class_names = {0: "Água", 1: "Vegetação", 2: "Sedimento"}
+        print(f"     Classe {cls} ({class_names[cls]}): {count}")
+    print("\n⚠ Para reprocessar, delete os arquivos CSV e state JSON.")
+    raise SystemExit(0)
+
+print("✓ Nenhum checkpoint encontrado. Iniciando processamento completo.")
+
+# =========================================================================
+# AUTO-CALIBRAÇÃO DOS LIMIARES DE SEDIMENTO
+# =========================================================================
+
+print("\n" + "-" * 70)
+print("AUTO-CALIBRANDO LIMIARES DE SEDIMENTO")
+print("-" * 70)
+
+print("Calculando percentis de BSI e MNDWI...")
+
+bsi_pct = train_img.select("BSI").reduceRegion(
+    reducer=ee.Reducer.percentile([70, 80, 90]),
+    geometry=AOI,
+    scale=30,
+    maxPixels=1e13
+)
+
+mndwi_pct = train_img.select("MNDWI").reduceRegion(
+    reducer=ee.Reducer.percentile([70, 80, 90]),
+    geometry=AOI,
+    scale=30,
+    maxPixels=1e13
+)
+
+bsi_p = bsi_pct.getInfo() or {}
+mndwi_p = mndwi_pct.getInfo() or {}
+
+BSI_p70 = bsi_p.get("BSI_p70", 0.02)
+BSI_p80 = bsi_p.get("BSI_p80", S_BSI_MIN_FALLBACK)
+BSI_p90 = bsi_p.get("BSI_p90", 0.05)
+
+M_p70 = mndwi_p.get("MNDWI_p70", S_MNDWI_MAX_FALLBACK)
+M_p80 = mndwi_p.get("MNDWI_p80", -0.02)
+M_p90 = mndwi_p.get("MNDWI_p90", -0.10)
+
+S_BSI_MIN   = float(BSI_p80)
+S_MNDWI_MAX = float(M_p70)
+
+print(f"✓ Percentis calculados:")
+print(f"   BSI:   p70={BSI_p70:.4f}, p80={BSI_p80:.4f}, p90={BSI_p90:.4f}")
+print(f"   MNDWI: p70={M_p70:.4f}, p80={M_p80:.4f}, p90={M_p90:.4f}")
+print(f"\n✓ Limiares iniciais de sedimento:")
+print(f"   BSI > {S_BSI_MIN:.4f}")
+print(f"   MNDWI < {S_MNDWI_MAX:.4f}")
+
+thr_used = {
+    "TRAIN_START": TRAIN_START,
+    "TRAIN_END": TRAIN_END,
+    "MIN_VALID_FRAC": MIN_VALID_FRAC,
+    "W_MNDWI_MIN": W_MNDWI_MIN,
+    "W_NDVI_MAX": W_NDVI_MAX,
+    "V_NDVI_MIN": V_NDVI_MIN,
+    "V_BSI_MAX": V_BSI_MAX,
+    "S_BSI_MIN_init": float(S_BSI_MIN),
+    "S_MNDWI_MAX_init": float(S_MNDWI_MAX),
+    "BSI_p70": float(BSI_p70),
+    "BSI_p80": float(BSI_p80),
+    "BSI_p90": float(BSI_p90),
+    "MNDWI_p70": float(M_p70),
+    "MNDWI_p80": float(M_p80),
+    "MNDWI_p90": float(M_p90),
+    "N_TARGET": N_TARGET,
+    "OVERSAMPLE": OVERSAMPLE,
+    "MIN_PER_CLASS": MIN_PER_CLASS,
+    "BATCH_SIZE": BATCH_SIZE
+}
+
+# =========================================================================
+# CRIAÇÃO DE MÁSCARAS E AMOSTRAGEM - MÉTODO CORRIGIDO
+# =========================================================================
+
+print("\n" + "-" * 70)
+print("CRIANDO MÁSCARAS E AMOSTRANDO PONTOS")
+print("-" * 70)
+
+def build_masks(s_bsi_min, s_mndwi_max):
+    """Constrói máscaras booleanas para cada classe"""
+    
+    water = train_img.expression(
+        "(mndwi > a) && (ndvi < b)",
+        {
+            "mndwi": train_img.select("MNDWI"),
+            "ndvi": train_img.select("NDVI"),
+            "a": W_MNDWI_MIN,
+            "b": W_NDVI_MAX
+        }
+    )
+
+    veg = train_img.expression(
+        "(ndvi > a) && (bsi < b)",
+        {
+            "ndvi": train_img.select("NDVI"),
+            "bsi": train_img.select("BSI"),
+            "a": V_NDVI_MIN,
+            "b": V_BSI_MAX
+        }
+    )
+
+    sed = train_img.expression(
+        "(bsi > a) && (mndwi < b)",
+        {
+            "bsi": train_img.select("BSI"),
+            "mndwi": train_img.select("MNDWI"),
+            "a": s_bsi_min,
+            "b": s_mndwi_max
+        }
+    )
+
+    return water, veg, sed
+
+def stratified_sample(img, mask, n_points, class_value, seed):
+    """
+    Amostra pontos estratificados diretamente da imagem.
+    CORREÇÃO: Usa stratifiedSample ao invés de randomPoints + sampleRegions
+    """
+    # Adicionar banda de classe
+    img_with_class = img.addBands(ee.Image.constant(class_value).rename("class"))
+    
+    # Aplicar máscara
+    img_masked = img_with_class.updateMask(mask)
+    
+    # Amostragem estratificada
+    samples = img_masked.stratifiedSample(
+        numPoints=n_points,
+        classBand="class",
+        region=AOI,
+        scale=30,
+        seed=seed,
+        geometries=False
+    )
+    
+    return samples
+
+# =========================================================================
+# RELAXAMENTO ITERATIVO
+# =========================================================================
+
+print("\n" + "-" * 70)
+print("OTIMIZANDO LIMIARES (RELAXAMENTO ITERATIVO)")
+print("-" * 70)
+
+attempts = [
+    (1.00, 0.00),
+    (0.90, 0.00),
+    (0.80, 0.00),
+    (0.70, 0.00),
+    (0.70, 0.05),
+    (0.60, 0.05),
+    (0.50, 0.07),
+]
+
+best_counts = None
+best_params = None
+best_samples = None
+
+for i, (mul, off) in enumerate(attempts, 1):
+    s_bsi = float(S_BSI_MIN * mul)
+    s_mnd = float(S_MNDWI_MAX + off)
+
+    water_mask, veg_mask, sed_mask = build_masks(s_bsi, s_mnd)
+
+    # Calcular pontos por classe (com oversample)
+    points_per_class = int(N_TARGET * OVERSAMPLE)
+
+    try:
+        # Amostrar cada classe
+        W = stratified_sample(train_img, water_mask, points_per_class, 0, 11)
+        V = stratified_sample(train_img, veg_mask, points_per_class, 1, 22)
+        S = stratified_sample(train_img, sed_mask, points_per_class, 2, 33)
+
+        nW = W.size().getInfo()
+        nV = V.size().getInfo()
+        nS = S.size().getInfo()
+
+        print(f"\nTentativa {i}/{len(attempts)}:")
+        print(f"  Água: {nW}, Vegetação: {nV}, Sedimento: {nS}")
+        print(f"  Limiares sedimento: BSI>{s_bsi:.4f}, MNDWI<{s_mnd:.4f}")
+
+        if best_counts is None or nS > best_counts["sed"]:
+            best_counts = {"water": nW, "veg": nV, "sed": nS}
+            best_params = {"S_BSI_MIN": s_bsi, "S_MNDWI_MAX": s_mnd}
+
+        if min(nW, nV, nS) >= MIN_PER_CLASS:
+            nmin = int(min(nW, nV, nS))
+            
+            # Limitar cada classe ao mínimo
+            W_limited = W.limit(nmin)
+            V_limited = V.limit(nmin)
+            S_limited = S.limit(nmin)
+            
+            # Combinar
+            best_samples = W_limited.merge(V_limited).merge(S_limited)
+            
+            thr_used["S_BSI_MIN"] = s_bsi
+            thr_used["S_MNDWI_MAX"] = s_mnd
+            thr_used["BALANCED_PER_CLASS"] = nmin
+            
+            print(f"\n✅ LIMIARES ACEITOS!")
+            print(f"   Amostras balanceadas por classe: {nmin}")
+            print(f"   Total de amostras: {nmin * 3}")
+            break
+            
+    except Exception as e:
+        print(f"  ⚠ Erro na tentativa {i}: {e}")
+        continue
+
+if best_samples is None:
+    raise RuntimeError(
+        f"\n❌ NÃO FOI POSSÍVEL ATINGIR {MIN_PER_CLASS} AMOSTRAS POR CLASSE\n\n"
+        f"Melhor resultado: {best_counts}\n"
+        f"Melhores parâmetros: {best_params}\n"
+    )
+
+# =========================================================================
+# EXTRAÇÃO EM LOTES
+# =========================================================================
+
+print("\n" + "=" * 70)
+print("EXTRAINDO FEATURES ESPECTRAIS (EM LOTES)")
+print("=" * 70)
+
+total_samples = best_samples.size().getInfo()
+num_batches = (total_samples + BATCH_SIZE - 1) // BATCH_SIZE
+
+print(f"\nTotal de amostras: {total_samples}")
+print(f"Tamanho do lote: {BATCH_SIZE}")
+print(f"Número de lotes: {num_batches}")
+
+all_dfs = []
+
+for batch_idx in range(num_batches):
+    start = batch_idx * BATCH_SIZE
+    
+    print(f"\n--- Lote {batch_idx + 1}/{num_batches} ---")
+    print(f"Extraindo amostras {start}-{start + BATCH_SIZE - 1}...")
+    
+    # Pegar subset
+    batch_fc = ee.FeatureCollection(best_samples.toList(BATCH_SIZE, start))
+    
+    # Retry logic
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            batch_df = geemap.ee_to_df(batch_fc)
+            
+            if len(batch_df) > 0:
+                all_dfs.append(batch_df)
+                print(f"✓ Extraídas {len(batch_df)} amostras")
+            else:
+                print(f"⚠ Lote vazio")
+            break
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** (attempt + 1)
+                print(f"⚠ Erro: {str(e)[:100]}")
+                print(f"  Tentativa {attempt + 2}/{max_retries} em {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"❌ Lote falhou após {max_retries} tentativas")
+                raise
+    
+    if batch_idx < num_batches - 1:
+        time.sleep(1)
+
+# =========================================================================
+# COMBINAR E SALVAR
+# =========================================================================
+
+print("\n" + "=" * 70)
+print("FINALIZANDO")
+print("=" * 70)
+
+if not all_dfs:
+    raise RuntimeError("Nenhuma amostra foi extraída!")
+
+print("\nCombinando lotes...")
+df = pd.concat(all_dfs, ignore_index=True)
+
+print(f"✓ Total de linhas: {len(df)}")
+print(f"✓ Colunas: {list(df.columns)}")
+
+# Verificar se temos as colunas necessárias
+required_cols = FEATURES + ["class"]
+missing_cols = [col for col in required_cols if col not in df.columns]
+
+if missing_cols:
+    raise RuntimeError(f"Colunas faltando no DataFrame: {missing_cols}")
+
+# Limpar dados
+print("Removendo valores ausentes...")
+original_len = len(df)
+df = df.dropna(subset=required_cols).copy()
+df["class"] = df["class"].astype(int)
+
+if len(df) < original_len:
+    print(f"⚠ Removidas {original_len - len(df)} linhas com valores ausentes")
+
+# Salvar
+print(f"\nSalvando amostras: {SAMPLES_CSV}")
+df.to_csv(SAMPLES_CSV, index=False)
+
+print(f"Salvando limiares: {THR_JSON}")
+with open(THR_JSON, "w") as f:
+    json.dump(thr_used, f, indent=2)
+
+state["samples_saved"] = True
+state["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+save_state(state)
+print(f"Salvando estado: {STATE_JSON}")
+
+# =========================================================================
+# RESUMO FINAL
+# =========================================================================
+
+print("\n" + "=" * 70)
+print("✅ PROCESSAMENTO CONCLUÍDO COM SUCESSO")
+print("=" * 70)
+
+print(f"\n📁 ARQUIVO: {SAMPLES_CSV}")
+print(f"   Total: {len(df)} amostras")
+
+class_names = {0: "Água", 1: "Vegetação", 2: "Sedimento"}
+print(f"\n   Distribuição:")
+for cls in sorted(df["class"].unique()):
+    count = len(df[df["class"] == cls])
+    pct = 100 * count / len(df)
+    print(f"     {class_names[cls]:12s}: {count:4d} ({pct:5.1f}%)")
+
+print(f"\n   Features: {', '.join(FEATURES)}")
+print(f"\n📁 Limiares: {THR_JSON}")
+print(f"📁 Estado: {STATE_JSON}")
+
+print("\n" + "=" * 70)
+print("✅ Pronto para treinamento do modelo!")
+print("=" * 70)
