@@ -1,0 +1,29 @@
+!pip install -q geopandas shapely pyproj
+import os
+
+SHP_DIR = "/content/drive/MyDrive/Candonga"
+SHP_PATH = os.path.join(SHP_DIR, "CandongaReservatorio.shp")
+
+print("Shapefile:", SHP_PATH)
+
+import geopandas as gpd
+
+gdf = gpd.read_file(SHP_PATH)
+
+# Ensure single AOI geometry (dissolve if multiple features)
+gdf = gdf.to_crs("EPSG:4326")
+aoi_geom = gdf.unary_union  # shapely geometry
+
+print("AOI features:", len(gdf))
+print("AOI geom type:", aoi_geom.geom_type)
+print("AOI bounds (lon/lat):", aoi_geom.bounds)
+
+import ee, geemap
+
+# Convert GeoDataFrame directly to EE FeatureCollection
+aoi_fc = geemap.geopandas_to_ee(gdf)
+
+# Use geometry only (strict AOI)
+AOI = aoi_fc.geometry()
+
+print("AOI area (m²):", AOI.area(1).getInfo())
