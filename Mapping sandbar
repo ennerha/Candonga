@@ -1,0 +1,181 @@
+# =========================================================
+# FIGURE — SANDBAR (SEDIMENT) SPATIO-TEMPORAL PANELS — 500 DPI
+# Uses Earth Engine THUMBNAILS (no Drive GeoTIFFs needed)
+#
+# Requires in memory:
+#   AOI (ee.Geometry)
+#   landsat (preprocessed ImageCollection) WITH: NDVI,MNDWI,BSI,NDMI,NBR2
+#   clf (trained ee.Classifier) 3-class: 0=Water, 1=Veg/Macrophytes, 2=Sediment (sandbars)
+#
+# Output:
+#   /content/results/Figure_Sandbars_Evolution_500dpi.tif
+#   plus downloaded thumbs in /content/results/thumbs_sandbars/
+# =========================================================
+
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import ee
+import requests
+from PIL import Image
+from requests.exceptions import Timeout, RequestException
+
+# -------------------------
+# SETTINGS
+# -------------------------
+YEARS = [2005, 2008, 2011, 2014, 2016, 2018, 2020, 2023, 2025]  # panels (edit)
+NROWS, NCOLS = 3, 3
+DPI = 500
+
+SCALE_CLASSIFY = 30
+SEDIMENT_CLASS_VALUE = 2
+
+# Thumbnail resolution (bigger = sharper; keep reasonable)
+THUMB_DIMS = 1200  # pixels (width), height auto - reduced from 1400 for better performance
+
+OUT_DIR = "/content/results"
+THUMB_DIR = f"{OUT_DIR}/thumbs_sandbars"
+os.makedirs(THUMB_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+OUT_TIF = f"{OUT_DIR}/Figure_Sandbars_Evolution_500dpi.tif"
+
+# Visualization palette for sediment/sandbars
+# Masked background will be transparent (we keep only sediment pixels with selfMask())
+SEDIMENT_PALETTE = ["FFFFFF", "C2B280"]  # white -> sand/tan
+BORDER_COLOR     = "000000"              # black outline
+
+# IMPORTANT: classifier inputs must exist in landsat
+FEATURES = ["NDVI","MNDWI","BSI","NDMI","NBR2"]
+
+# -------------------------
+# CHECKS
+# -------------------------
+for v in ["AOI", "landsat", "clf"]:
+    if v not in globals():
+        raise NameError(f"Missing required variable: {v}")
+
+# Check bands once (avoid painful runtime errors)
+bnames = landsat.first().bandNames().getInfo()
+missing = [b for b in FEATURES if b not in bnames]
+if missing:
+    raise ValueError(
+        f"landsat is missing bands required for sediment mapping: {missing}\n"
+        f"Found bands: {bnames}\n"
+        "Fix: ensure your preprocessing adds NDVI,MNDWI,BSI,NDMI,NBR2 to each image."
+    )
+
+# Use AOI bounds region for thumbnails (one getInfo only)
+REGION = AOI.bounds().getInfo()["coordinates"]
+
+# -------------------------
+# FUNCTIONS
+# -------------------------
+def annual_sediment_image(year):
+    """Binary sediment/sandbar mask (1=sediment) using annual median composite."""
+    start = ee.Date.fromYMD(year, 1, 1)
+    end   = ee.Date.fromYMD(year + 1, 1, 1)
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _compute():
+        # Limit to max 50 images to speed up median computation
+        limited_col = ee.ImageCollection(
+            ee.Algorithms.If(n.gt(50), col.limit(50), col)
+        )
+        comp = limited_col.median().clip(AOI)
+        pred = comp.select(FEATURES).classify(clf).rename("class")
+        valid = comp.select("NDVI").mask()
+
+        # sediment pixels only, keep mask for transparency
+        sed = pred.eq(SEDIMENT_CLASS_VALUE).And(valid).selfMask().rename("sediment")
+        return sed.set({"year": year, "n_images": n})
+
+    empty = ee.Image(0).updateMask(ee.Image(0)).rename("sediment").set({"year": year, "n_images": n})
+    return ee.Image(ee.Algorithms.If(n.gt(0), _compute(), empty))
+
+def make_frame(year):
+    """Create an RGB visualization image with AOI border + sediment mask."""
+    sed = annual_sediment_image(year)
+
+    sed_vis = sed.visualize(min=0, max=1, palette=SEDIMENT_PALETTE)
+
+    # AOI border
+    border = ee.Image().byte().paint(AOI, 1, 2).selfMask().visualize(palette=[BORDER_COLOR])
+
+    # Mosaic border on top
+    frame = ee.ImageCollection([sed_vis, border]).mosaic()
+    return frame
+
+def download_thumb(year, out_png, max_retries=3):
+    """Download thumbnail with retry logic and exponential backoff."""
+    frame = make_frame(year)
+    url = frame.getThumbURL({
+        "region": REGION,
+        "dimensions": THUMB_DIMS,
+        "format": "png"
+    })
+    
+    for attempt in range(max_retries):
+        try:
+            # Increase timeout with each retry, max 10 minutes
+            timeout = min(180 * (attempt + 1), 600)
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            with open(out_png, "wb") as f:
+                f.write(r.content)
+            return  # Success!
+        except (Timeout, RequestException) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                print(f"⚠ Timeout (attempt {attempt+1}/{max_retries}). Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"❌ Failed after {max_retries} attempts: {e}")
+                raise
+
+# -------------------------
+# DOWNLOAD THUMBNAILS
+# -------------------------
+png_paths = {}
+print("\n--- DOWNLOADING SANDBAR THUMBNAILS ---")
+for y in YEARS:
+    out_png = f"{THUMB_DIR}/sandbars_{y}.png"
+    png_paths[y] = out_png
+
+    if not os.path.exists(out_png):
+        print(f"Downloading thumbnail for {y} ...", end=" ", flush=True)
+        download_thumb(y, out_png)
+        print("✓ OK")
+        time.sleep(1)  # Brief pause between downloads to avoid throttling
+    else:
+        print(f"Thumbnail exists for {y} (skip)")
+
+# -------------------------
+# BUILD MULTI-PANEL FIGURE (500 dpi TIFF)
+# -------------------------
+print("\n--- BUILDING MULTI-PANEL FIGURE ---")
+
+fig, axes = plt.subplots(NROWS, NCOLS, figsize=(12, 12))
+axes = axes.flatten()
+
+for i, (ax, y) in enumerate(zip(axes, YEARS)):
+    img = Image.open(png_paths[y]).convert("RGBA")
+    arr = np.array(img)
+
+    ax.imshow(arr)
+    panel_letter = chr(ord("a") + i)
+    ax.set_title(f"({panel_letter}) {y}", fontsize=12)
+    ax.axis("off")
+
+# Turn off extra axes if any
+for j in range(len(YEARS), len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+plt.savefig(OUT_TIF, dpi=DPI, bbox_inches="tight")
+plt.close(fig)
+
+print(f"\n✅ Saved multi-panel figure (TIFF {DPI} dpi): {OUT_TIF}")
+print(f"📁 Thumbnails saved in: {THUMB_DIR}")
