@@ -1,0 +1,287 @@
+# =========================================================
+# STEP E — ANNUAL SPATIAL EVOLUTION (MAPS AS VIDEO) — YEAR ON EVERY FRAME (FIXED)
+# Exports MP4 showing yearly macrophyte maps inside AOI (2005–2025),
+# with YEAR written on each frame (server-side, lightweight).
+#
+# Requires in memory:
+#   - AOI (ee.Geometry)
+#   - landsat (preprocessed ImageCollection with: NDVI,MNDWI,BSI,NDMI,NBR2)
+#   - clf (trained ee.Classifier expecting: NDVI,MNDWI,BSI,NDMI,NBR2)
+#
+# Output:
+#   - Drive folder: Candonga_Macrophytes
+#   - MP4: macrophytes_annual_2005_2025.mp4
+# =========================================================
+
+import ee
+
+# -------------------------
+# Settings
+# -------------------------
+START_YEAR = 2005
+END_YEAR   = 2025
+
+SCALE = 30
+MAX_PIX = 1e13
+MACRO_CLASS_VALUE = 1
+
+EXPORT_FOLDER = "Candonga_Macrophytes"
+VIDEO_NAME = "macrophytes_annual_2005_2025"
+
+FPS = 2
+DIMENSIONS = 1080
+
+# Visualization
+MACRO_COLOR = "2E7D32"  # green
+TEXT_COLOR  = "FFFFFF"  # white
+TEXT_BG     = "000000"  # black
+
+# Label placement (degrees offsets from top-left of AOI bounds)
+LABEL_DX_DEG = 0.0020   # right
+LABEL_DY_DEG = 0.0020   # down
+
+# Label size (meters -> converted to degrees internally)
+LABEL_PIXEL_M = 45      # 30/45/60 to tune size
+BOX_PAD = 1
+CHAR_SPACING = 1
+
+# Optional: export per-year binary GeoTIFFs (many tasks)
+EXPORT_ANNUAL_GEOTIFFS = False
+
+NEEDED_BANDS = ["NDVI","MNDWI","BSI","NDMI","NBR2"]
+
+# -------------------------
+# Hard checks
+# -------------------------
+if "AOI" not in globals():
+    raise NameError("AOI is not defined.")
+if "landsat" not in globals():
+    raise NameError("landsat not found.")
+if "clf" not in globals():
+    raise NameError("clf not found.")
+
+try:
+    ee.Number(1).getInfo()
+except Exception as e:
+    raise RuntimeError("Earth Engine not initialized.") from e
+
+# -------------------------
+# Digit glyphs 5x7
+# -------------------------
+GLYPH_W = 5
+GLYPH_H = 7
+
+DIGITS_5x7 = ee.Dictionary({
+    "0": ee.List(["11111","10001","10001","10001","10001","10001","11111"]),
+    "1": ee.List(["00100","01100","00100","00100","00100","00100","01110"]),
+    "2": ee.List(["11111","00001","00001","11111","10000","10000","11111"]),
+    "3": ee.List(["11111","00001","00001","01111","00001","00001","11111"]),
+    "4": ee.List(["10001","10001","10001","11111","00001","00001","00001"]),
+    "5": ee.List(["11111","10000","10000","11111","00001","00001","11111"]),
+    "6": ee.List(["11111","10000","10000","11111","10001","10001","11111"]),
+    "7": ee.List(["11111","00001","00010","00100","01000","01000","01000"]),
+    "8": ee.List(["11111","10001","10001","11111","10001","10001","11111"]),
+    "9": ee.List(["11111","10001","10001","11111","00001","00001","11111"])
+})
+
+# -------------------------
+# Helpers
+# -------------------------
+def year_window(y_num):
+    """y_num is ee.Number (server-side safe)"""
+    y = ee.Number(y_num).toInt()
+    start = ee.Date.fromYMD(y, 1, 1)
+    end   = ee.Date.fromYMD(y.add(1), 1, 1)  # FIX: y.add(1) instead of y+1
+    return start, end
+
+def annual_macro_binary(y_num):
+    """Binary macrophyte mask (1=macro) masked by valid pixels."""
+    y = ee.Number(y_num).toInt()
+    start, end = year_window(y)
+
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _compute():
+        comp = col.median().clip(AOI)
+        comp_sel = comp.select(NEEDED_BANDS)
+
+        pred = comp_sel.classify(clf).rename("class")
+        valid = comp_sel.select("NDVI").mask()
+
+        macro = pred.eq(MACRO_CLASS_VALUE).And(valid).rename("macro")
+
+        return macro.updateMask(valid).set({
+            "year": y,
+            "n_images": n,
+            "system:time_start": start.millis()
+        })
+
+    empty = ee.Image(0).rename("macro").updateMask(ee.Image(0)).set({
+        "year": y,
+        "n_images": n,
+        "system:time_start": start.millis()
+    })
+
+    return ee.Image(ee.Algorithms.If(n.gt(0), _compute(), empty))
+
+def top_left_anchor(aoi):
+    """Top-left corner of AOI bounds."""
+    b = ee.Geometry(aoi.bounds())
+    ring = ee.List(b.coordinates().get(0))
+    xmin_ymax = ee.List(ring.get(1))  # [xmin, ymax]
+    return ee.Number(xmin_ymax.get(0)), ee.Number(xmin_ymax.get(1))
+
+def meters_to_deg_steps(aoi, px_m):
+    """Convert ~meters to degrees at AOI latitude (fast approximation)."""
+    lat = ee.Number(ee.Geometry(aoi.centroid(10)).coordinates().get(1))
+    lat_rad = lat.multiply(3.141592653589793).divide(180.0)
+
+    dy = ee.Number(px_m).divide(111320.0)
+    dx = ee.Number(px_m).divide(111320.0).divide(lat_rad.cos().max(0.2))
+    return dx, dy
+
+def draw_year_label(year_num, aoi):
+    """Returns an RGB ee.Image with black box + white year digits."""
+    year_str = ee.Number(year_num).format("%d")      # ee.String
+    chars = year_str.split("")                       # ee.List
+    n_chars = chars.length()
+
+    dx_deg, dy_deg = meters_to_deg_steps(aoi, LABEL_PIXEL_M)
+
+    xmin, ymax = top_left_anchor(aoi)
+    x0 = xmin.add(LABEL_DX_DEG)
+    y0 = ymax.subtract(LABEL_DY_DEG)
+
+    text_w_px = ee.Number(n_chars).multiply(GLYPH_W).add(ee.Number(n_chars).subtract(1).multiply(CHAR_SPACING))
+    text_h_px = ee.Number(GLYPH_H)
+    box_w_px  = text_w_px.add(2 * BOX_PAD)
+    box_h_px  = text_h_px.add(2 * BOX_PAD)
+
+    x1 = x0.add(dx_deg.multiply(box_w_px))
+    y1 = y0.subtract(dy_deg.multiply(box_h_px))
+
+    bg_poly = ee.Geometry.Polygon([[
+        [x0, y0],
+        [x1, y0],
+        [x1, y1],
+        [x0, y1],
+        [x0, y0]
+    ]])
+
+    bg = ee.Image().byte().paint(ee.FeatureCollection([ee.Feature(bg_poly, {"v": 1})]), 1).selfMask()
+    bg_vis = bg.visualize(min=0, max=1, palette=[TEXT_BG])
+
+    def add_digit(i, acc):
+        i = ee.Number(i)
+        acc = ee.FeatureCollection(acc)
+
+        ch = ee.String(chars.get(i))
+        rows = ee.List(DIGITS_5x7.get(ch))
+
+        x_cursor = ee.Number(BOX_PAD).add(i.multiply(GLYPH_W + CHAR_SPACING))
+        y_cursor = ee.Number(BOX_PAD)
+
+        def row_fn(r):
+            r = ee.Number(r)
+            row_str = ee.String(rows.get(r))
+
+            def col_fn(c):
+                c = ee.Number(c)
+                bit = ee.String(row_str.slice(c, c.add(1)))
+                on = bit.compareTo("1").eq(0)
+
+                px = x_cursor.add(c)
+                py = y_cursor.add(r)
+
+                lon = x0.add(dx_deg.multiply(px))
+                lat = y0.subtract(dy_deg.multiply(py))
+
+                feat = ee.Feature(ee.Geometry.Point([lon, lat]), {"v": 1})
+                return ee.Algorithms.If(on, feat, None)
+
+            cols = ee.List.sequence(0, GLYPH_W - 1).map(col_fn)
+            return cols
+
+        feats_nested = ee.List.sequence(0, GLYPH_H - 1).map(row_fn)
+        feats = feats_nested.flatten().removeAll([None])
+
+        return acc.merge(ee.FeatureCollection(feats))
+
+    digits_fc = ee.FeatureCollection(
+        ee.List.sequence(0, n_chars.subtract(1)).iterate(
+            lambda i, acc: add_digit(i, acc),
+            ee.FeatureCollection([])
+        )
+    )
+
+    digits = ee.Image().byte().paint(digits_fc, 1).selfMask()
+    digits = digits.focal_max(radius=LABEL_PIXEL_M * 0.45, units="meters").selfMask()
+    digits_vis = digits.visualize(min=0, max=1, palette=[TEXT_COLOR])
+
+    return ee.ImageCollection([bg_vis, digits_vis]).mosaic()
+
+def to_vis(img):
+    macro = img.select("macro").selfMask()
+    macro_vis = macro.visualize(min=0, max=1, palette=[MACRO_COLOR])
+
+    y = ee.Number(img.get("year"))
+    label = draw_year_label(y, AOI)
+
+    out = ee.ImageCollection([macro_vis, label]).mosaic()
+    return out.set("system:time_start", img.get("system:time_start"))
+
+def export_geotiff(img, description, file_prefix):
+    task = ee.batch.Export.image.toDrive(
+        image=img,
+        description=description,
+        folder=EXPORT_FOLDER,
+        fileNamePrefix=file_prefix,
+        region=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    )
+    task.start()
+    print("Started GeoTIFF export:", description)
+
+# -------------------------
+# Build annual collection (SERVER-SIDE)
+# -------------------------
+years = ee.List.sequence(START_YEAR, END_YEAR)
+
+annual = ee.ImageCollection.fromImages(
+    years.map(lambda y: annual_macro_binary(y))
+)
+
+# -------------------------
+# Visualization collection for video
+# -------------------------
+vis_col = annual.map(to_vis)
+
+# -------------------------
+# Export MP4 video to Drive
+# -------------------------
+video_task = ee.batch.Export.video.toDrive(
+    collection=vis_col,
+    description=f"{VIDEO_NAME}_mp4",
+    folder=EXPORT_FOLDER,
+    fileNamePrefix=VIDEO_NAME,
+    framesPerSecond=FPS,
+    region=AOI,
+    dimensions=DIMENSIONS,
+    maxPixels=MAX_PIX
+)
+video_task.start()
+
+print("✅ Started VIDEO export (MP4):", VIDEO_NAME, "→ Drive folder:", EXPORT_FOLDER)
+print("➡️ Open the Earth Engine Tasks tab and click RUN.")
+
+# -------------------------
+# Optional: Export annual GeoTIFFs
+# -------------------------
+if EXPORT_ANNUAL_GEOTIFFS:
+    for yy in range(START_YEAR, END_YEAR + 1):
+        img = annual_macro_binary(yy).select("macro").toByte()
+        export_geotiff(img, f"MACRO_BINARY_{yy}", f"macrophyte_binary_{yy}")
+
+print("Done.")
