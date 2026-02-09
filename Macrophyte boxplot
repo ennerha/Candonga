@@ -1,0 +1,112 @@
+# =========================================================
+# FINAL — BOXPLOT (2005–2025) FROM EE EXPORT — ROBUST & FINAL
+# No getInfo(), no memory error, no filename guessing
+# =========================================================
+
+import os
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from google.colab import drive
+
+# -------------------------
+# SETTINGS
+# -------------------------
+DRIVE_FOLDER = "/content/drive/MyDrive/Candonga_Macrophytes"
+OUT_DIR = "/content/results"
+OUT_FIG = f"{OUT_DIR}/Figure_Boxplot_Macrophytes_2005_2025_500dpi.tif"
+
+START_YEAR = 2005
+END_YEAR   = 2025
+EVENT_YEAR = 2015
+DPI = 500
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# -------------------------
+# MOUNT DRIVE
+# -------------------------
+drive.mount("/content/drive")
+
+# -------------------------
+# WAIT FOR CSV TO EXIST
+# -------------------------
+print("🔎 Waiting for exported CSV in Drive...")
+
+csv_path = None
+for _ in range(60):  # wait up to ~5 minutes
+    if os.path.exists(DRIVE_FOLDER):
+        files = [f for f in os.listdir(DRIVE_FOLDER) if f.startswith("macrophyte_scene_table_2005_2025")]
+        if len(files) > 0:
+            csv_path = os.path.join(DRIVE_FOLDER, files[0])
+            break
+    time.sleep(5)
+
+if csv_path is None:
+    raise FileNotFoundError(
+        "CSV not found. Make sure the Earth Engine task FINISHED (status = COMPLETED)."
+    )
+
+print(f"✅ CSV found:\n{csv_path}")
+
+# -------------------------
+# READ + CLEAN DATA
+# -------------------------
+df = pd.read_csv(csv_path)
+
+df["year"] = df["year"].astype(int)
+df["macro_km2"] = pd.to_numeric(df["macro_km2"], errors="coerce")
+df = df.dropna(subset=["macro_km2"])
+
+df = df[(df["year"] >= START_YEAR) & (df["year"] <= END_YEAR)]
+
+counts = df.groupby("year").size()
+print("\n📊 Landsat scenes per year:")
+print(counts)
+
+# -------------------------
+# PREPARE BOXPLOT DATA
+# -------------------------
+years = list(range(START_YEAR, END_YEAR + 1))
+data = [df[df["year"] == y]["macro_km2"].values for y in years]
+
+# -------------------------
+# PLOT
+# -------------------------
+plt.figure(figsize=(18, 7))
+
+plt.boxplot(
+    data,
+    labels=[str(y) for y in years],
+    showfliers=False,
+    widths=0.6
+)
+
+# Jittered points
+for i, y in enumerate(years, start=1):
+    vals = df[df["year"] == y]["macro_km2"].values
+    if len(vals) > 0:
+        x = np.random.normal(i, 0.05, size=len(vals))
+        plt.scatter(x, vals, s=10, alpha=0.35)
+
+# Event marker
+event_x = years.index(EVENT_YEAR) + 1
+plt.axvline(event_x, color="red", linestyle="--", linewidth=2,
+            label="Mariana disaster (2015)")
+
+plt.title(
+    "Candonga Reservoir — Annual distribution of macrophyte area per Landsat scene",
+    fontsize=16, fontweight="bold"
+)
+plt.xlabel("Year", fontsize=13, fontweight="bold")
+plt.ylabel("Macrophyte area (km²)", fontsize=13, fontweight="bold")
+plt.grid(axis="y", alpha=0.3)
+plt.legend()
+
+plt.tight_layout()
+plt.savefig(OUT_FIG, dpi=DPI, bbox_inches="tight")
+plt.close()
+
+print("\n✅ FINAL FIGURE SAVED:")
+print(OUT_FIG)
