@@ -1,0 +1,196 @@
+# =========================================================
+# FIGURE — ANNUAL MACROPHYTE MAP PANELS (a,b,c,...) — 500 DPI
+# Uses Earth Engine THUMBNAILS (no Drive GeoTIFFs needed)
+#
+# Requires in memory:
+#   AOI (ee.Geometry), landsat (preprocessed), clf (trained)
+#
+# IMPORTANT FIXES (vs your draft):
+#  - Classifier expects 5 bands (NDVI, MNDWI, BSI, NDMI, NBR2) -> we classify with ALL 5
+#  - Robust thumbnail region handling (GeoJSON bounds)
+#  - Retry logic for thumbnail download
+#
+# Output:
+#   /content/results/Figure_Macrophyte_Evolution_500dpi.tif
+#   plus downloaded thumbs in /content/results/thumbs/
+# =========================================================
+
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import ee
+import requests
+from PIL import Image
+
+# -------------------------
+# SETTINGS
+# -------------------------
+YEARS = [2005, 2008, 2011, 2014, 2016, 2018, 2020, 2023, 2025]  # panels
+NROWS, NCOLS = 3, 3
+DPI = 500
+
+MACRO_CLASS_VALUE = 1
+
+# Must match your trained EE classifier inputs (3-class, 5 features)
+FEATURES = ["NDVI", "MNDWI", "BSI", "NDMI", "NBR2"]
+
+# Thumbnail resolution (bigger = sharper; keep reasonable)
+THUMB_DIMS = 1600  # width in pixels (height auto). Increase if you want sharper.
+
+OUT_DIR = "/content/results"
+THUMB_DIR = f"{OUT_DIR}/thumbs"
+os.makedirs(THUMB_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+OUT_TIF = f"{OUT_DIR}/Figure_Macrophyte_Evolution_500dpi.tif"
+
+# Visualization palette (RGB hex). Background stays transparent via masking.
+MACRO_PALETTE = ["FFFFFF", "1B5E20"]  # white->green (masked background won't show)
+BORDER_COLOR  = "000000"             # black outline
+
+# Border thickness (pixels in render space; use small integer)
+BORDER_WIDTH = 2
+
+# Requests config
+MAX_RETRIES = 5
+TIMEOUT_S   = 180
+SLEEP_BASE  = 2.0
+
+# -------------------------
+# HARD CHECKS
+# -------------------------
+for v in ["AOI", "landsat", "clf"]:
+    if v not in globals():
+        raise NameError(f"Missing required variable: {v}")
+
+try:
+    ee.Number(1).getInfo()
+except Exception as e:
+    raise RuntimeError("Earth Engine is not initialized in this runtime.") from e
+
+# Use AOI bounds (GeoJSON) once (avoid heavy server ops in loop)
+REGION_GEOJSON = AOI.bounds(1).getInfo()  # safe single getInfo
+
+# -------------------------
+# FUNCTIONS
+# -------------------------
+def year_window(year_int):
+    year_int = int(year_int)
+    return ee.Date.fromYMD(year_int, 1, 1), ee.Date.fromYMD(year_int + 1, 1, 1)
+
+def annual_macro_image(year_int):
+    """
+    Binary macrophyte mask (1=macro) using annual median composite.
+    IMPORTANT: classify with ALL FEATURES the classifier expects.
+    """
+    start, end = year_window(year_int)
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _compute():
+        comp = col.median().clip(AOI)
+
+        # Ensure required bands exist for classifier
+        comp_sel = comp.select(FEATURES)
+
+        pred = comp_sel.classify(clf).rename("class")
+        valid = comp_sel.select("NDVI").mask()
+
+        macro = pred.eq(MACRO_CLASS_VALUE).And(valid).selfMask().rename("macro")
+        return macro.set({"year": year_int, "n_images": n})
+
+    empty = ee.Image(0).updateMask(ee.Image(0)).rename("macro").set({"year": year_int, "n_images": n})
+    return ee.Image(ee.Algorithms.If(n.gt(0), _compute(), empty))
+
+def make_frame(year_int):
+    """RGB visualization with AOI border + macrophyte mask."""
+    macro = annual_macro_image(year_int)
+
+    macro_vis = macro.visualize(min=0, max=1, palette=MACRO_PALETTE)
+
+    # Paint AOI outline on top
+    border = (
+        ee.Image()
+        .byte()
+        .paint(AOI, 1, BORDER_WIDTH)
+        .selfMask()
+        .visualize(palette=[BORDER_COLOR])
+    )
+
+    return ee.ImageCollection([macro_vis, border]).mosaic()
+
+def get_thumb_url(img_rgb):
+    # getThumbURL accepts a dict with region + dimensions + format
+    return img_rgb.getThumbURL({
+        "region": REGION_GEOJSON,   # GeoJSON polygon
+        "dimensions": THUMB_DIMS,   # width in pixels
+        "format": "png"
+    })
+
+def download_thumb(year_int, out_png):
+    """Download EE thumbnail PNG with retries."""
+    img_rgb = make_frame(year_int)
+    url = get_thumb_url(img_rgb)
+
+    sess = requests.Session()
+    last_err = None
+    for k in range(MAX_RETRIES):
+        try:
+            r = sess.get(url, timeout=TIMEOUT_S)
+            r.raise_for_status()
+            with open(out_png, "wb") as f:
+                f.write(r.content)
+            return
+        except Exception as e:
+            last_err = e
+            wait = SLEEP_BASE * (2 ** k)
+            print(f"   ⚠ download failed (try {k+1}/{MAX_RETRIES}): {str(e)[:120]}")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Failed to download thumbnail for {year_int} after {MAX_RETRIES} retries: {last_err}")
+
+# -------------------------
+# DOWNLOAD THUMBNAILS
+# -------------------------
+png_paths = {}
+print("\n--- DOWNLOADING THUMBNAILS ---")
+for y in YEARS:
+    out_png = f"{THUMB_DIR}/macro_{y}.png"
+    png_paths[y] = out_png
+
+    if not os.path.exists(out_png):
+        print(f"Downloading thumbnail for {y} ...")
+        download_thumb(y, out_png)
+        print("   ✓ OK")
+    else:
+        print(f"Thumbnail exists for {y} (skip)")
+
+# -------------------------
+# BUILD MULTI-PANEL FIGURE
+# -------------------------
+print("\n--- BUILDING MULTI-PANEL FIGURE ---")
+fig, axes = plt.subplots(NROWS, NCOLS, figsize=(12, 12))
+axes = axes.flatten()
+
+for i, (ax, y) in enumerate(zip(axes, YEARS)):
+    img = Image.open(png_paths[y]).convert("RGBA")
+    arr = np.array(img)
+    ax.imshow(arr)
+
+    panel_letter = chr(ord("a") + i)
+    ax.set_title(f"({panel_letter}) {y}", fontsize=12)
+    ax.axis("off")
+
+# Turn off extra axes if any
+for j in range(len(YEARS), len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+
+# Save as TIFF 500 dpi
+plt.savefig(OUT_TIF, dpi=DPI, bbox_inches="tight")
+plt.close(fig)
+
+print(f"\n✅ Saved multi-panel figure (TIFF {DPI} dpi): {OUT_TIF}")
+print(f"📁 Thumbnails saved in: {THUMB_DIR}")
