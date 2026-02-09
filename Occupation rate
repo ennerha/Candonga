@@ -1,0 +1,257 @@
+# =========================================================
+# STEP B — SPATIAL OCCUPATION RATE (COLONIZATION vs CONSOLIDATION) — 3-CLASS / 5-FEATURES
+# 2005–2025 pixel-wise dynamics inside AOI:
+#   - first_year_macrophyte (colonization timing)
+#   - last_year_macrophyte
+#   - frequency (% years as macrophyte)
+#   - max_consecutive_years (persistence / consolidation)
+#   - colonization_pre2015 / colonization_post2015 (binary)
+#   - consolidation_mask (max_consecutive >= N)
+#
+# Requires in memory:
+#   - AOI (ee.Geometry)
+#   - landsat (preprocessed ImageCollection)  <<< MUST contain indices: NDVI,MNDWI,BSI,NDMI,NBR2
+#   - clf (trained ee.Classifier)             <<< trained with the SAME features above
+#
+# Exports (to Google Drive folder):
+#   - macro_first_year_2005_2025.tif
+#   - macro_last_year_2005_2025.tif
+#   - macro_frequency_pct_2005_2025.tif
+#   - macro_max_consecutive_2005_2025.tif
+#   - macro_colonized_pre2015.tif
+#   - macro_colonized_post2015.tif
+#   - macro_consolidation_maxrun_geN.tif
+#
+# Notes:
+#   - Uses server-side iterate to compute max consecutive years (run length)
+#   - Avoids heavy getInfo() calls that can timeout
+# =========================================================
+
+import ee
+
+# -------------------------
+# SETTINGS
+# -------------------------
+START_YEAR = 2005
+END_YEAR   = 2025
+EVENT_YEAR = 2015
+
+SCALE = 30
+MAX_PIX = 1e13
+
+# 3-class mapping (your pipeline):
+# 0=Água, 1=Vegetação/Macrófitas, 2=Sedimento
+MACRO_CLASS_VALUE = 1
+
+# Features expected by your current best model (RF 3-class)
+FEATURES = ["NDVI", "MNDWI", "BSI", "NDMI", "NBR2"]
+
+# Consolidation threshold (choose what you want to claim as "persistent")
+# Example: at least 3 consecutive years as macrophyte
+CONSOLIDATION_CONSEC_YEARS = 3
+
+EXPORT_FOLDER = "Candonga_Macrophytes"
+
+# -------------------------
+# HARD CHECKS
+# -------------------------
+for v in ["AOI", "landsat", "clf"]:
+    if v not in globals():
+        raise NameError(f"Missing required variable: {v}")
+
+# -------------------------
+# HELPERS
+# -------------------------
+def year_window_int(y_int):
+    y = ee.Number(y_int).toInt()
+    start = ee.Date.fromYMD(y, 1, 1)
+    end   = ee.Date.fromYMD(y.add(1), 1, 1)
+    return start, end
+
+def annual_macro_binary(y_int):
+    """
+    Returns an annual binary macrophyte image:
+      band: 'macro' (masked to valid pixels), values 1 where macro, 0 elsewhere (masked invalid)
+      props: year, n_images, system:time_start
+    """
+    y = ee.Number(y_int).toInt()
+    start, end = year_window_int(y)
+
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _compute():
+        comp = col.median().clip(AOI)
+
+        # --- IMPORTANT: classify with ALL expected features (fix for your earlier error) ---
+        pred = comp.select(FEATURES).classify(clf).rename("class")
+
+        valid = comp.select("NDVI").mask()
+        macro = pred.eq(MACRO_CLASS_VALUE).And(valid).rename("macro")
+
+        # keep valid mask, keep 1/0, but masked outside valid
+        macro = macro.updateMask(valid)
+
+        return macro.set({
+            "year": y,
+            "n_images": n,
+            "system:time_start": start.millis()
+        })
+
+    empty = ee.Image(0).rename("macro").updateMask(ee.Image(0)).set({
+        "year": y,
+        "n_images": n,
+        "system:time_start": start.millis()
+    })
+
+    return ee.Image(ee.Algorithms.If(n.gt(0), _compute(), empty))
+
+def export_geotiff(img, description, file_prefix, crs=None):
+    params = dict(
+        image=img,
+        description=description,
+        folder=EXPORT_FOLDER,
+        fileNamePrefix=file_prefix,
+        region=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    )
+    if crs is not None:
+        params["crs"] = crs
+
+    task = ee.batch.Export.image.toDrive(**params)
+    task.start()
+    print("Started export:", description)
+
+# -------------------------
+# BUILD ANNUAL COLLECTION (server-side)
+# -------------------------
+years = ee.List.sequence(START_YEAR, END_YEAR)
+annual_ic = ee.ImageCollection.fromImages(
+    years.map(lambda y: annual_macro_binary(ee.Number(y).toInt()))
+)
+
+print("Annual images (expected 21):", annual_ic.size().getInfo())
+
+# -------------------------
+# (1) FREQUENCY MAP (% of years as macrophyte)
+# mean of 0/1 (masked invalid) * 100
+# -------------------------
+freq_pct = annual_ic.select("macro").mean().multiply(100).rename("macro_freq_pct").set({
+    "start_year": START_YEAR,
+    "end_year": END_YEAR
+})
+
+# -------------------------
+# (2) FIRST YEAR / LAST YEAR OF MACROPHYTE OCCURRENCE (pixel-wise)
+# Strategy:
+#   For each year image:
+#     - mask year band by macro==1 (so only macro pixels contribute)
+#   Then reduce(min) => first year; reduce(max) => last year
+# -------------------------
+def add_year_band(img):
+    y = ee.Number(img.get("year")).toInt()
+    year_band = ee.Image.constant(y).rename("year").toInt16()
+    macro = img.select("macro")
+    # mask year band to macro pixels (and valid pixels)
+    year_masked = year_band.updateMask(macro)
+    return year_masked.set("year", y)
+
+year_only_ic = annual_ic.map(add_year_band)
+
+first_year = year_only_ic.reduce(ee.Reducer.min()).rename("macro_first_year").toInt16().set({
+    "start_year": START_YEAR,
+    "end_year": END_YEAR
+})
+
+last_year = year_only_ic.reduce(ee.Reducer.max()).rename("macro_last_year").toInt16().set({
+    "start_year": START_YEAR,
+    "end_year": END_YEAR
+})
+
+# Binary masks: colonized pre/post event (ever occurred in those windows)
+colonized_pre = first_year.lte(EVENT_YEAR - 1).rename("colonized_pre2015").toByte()
+colonized_post = first_year.gte(EVENT_YEAR).rename("colonized_post2015").toByte()
+
+# -------------------------
+# (3) MAX CONSECUTIVE YEARS (persistence / consolidation)
+# Server-side iterate over years to compute per-pixel run length.
+# -------------------------
+def iter_maxrun(y, state):
+    """
+    state is a Dictionary with:
+      - prev_run: ee.Image (current consecutive run length up to previous year)
+      - max_run:  ee.Image (max consecutive run length seen so far)
+    """
+    state = ee.Dictionary(state)
+    prev_run = ee.Image(state.get("prev_run"))
+    max_run  = ee.Image(state.get("max_run"))
+
+    y = ee.Number(y).toInt()
+    img = annual_macro_binary(y).select("macro").unmask(0).toByte()  # 0/1, no mask to allow counting
+
+    # run = (img==1) ? (prev_run + 1) : 0
+    run = prev_run.add(1).multiply(img).toInt16()
+
+    # max_run = max(max_run, run)
+    max_run2 = max_run.max(run).toInt16()
+
+    return ee.Dictionary({"prev_run": run, "max_run": max_run2})
+
+init_state = ee.Dictionary({
+    "prev_run": ee.Image.constant(0).toInt16(),
+    "max_run":  ee.Image.constant(0).toInt16()
+})
+
+state_out = ee.Dictionary(years.iterate(iter_maxrun, init_state))
+max_consecutive = ee.Image(state_out.get("max_run")).rename("macro_max_consecutive").toInt16().set({
+    "start_year": START_YEAR,
+    "end_year": END_YEAR
+})
+
+consolidation_mask = max_consecutive.gte(CONSOLIDATION_CONSEC_YEARS).rename(
+    f"macro_consolidation_ge{CONSOLIDATION_CONSEC_YEARS}y"
+).toByte()
+
+# -------------------------
+# (4) QUICK AOI SUMMARIES (lightweight numbers)
+# -------------------------
+def mean_over_aoi(img, band):
+    return img.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    ).get(band)
+
+def frac_over_aoi(mask_img, band):
+    # mean of 0/1 gives fraction
+    return mask_img.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=AOI,
+        scale=SCALE,
+        maxPixels=MAX_PIX
+    ).get(band)
+
+print("AOI mean frequency (% years as macro):", mean_over_aoi(freq_pct, "macro_freq_pct").getInfo())
+print("AOI mean max consecutive years:", mean_over_aoi(max_consecutive, "macro_max_consecutive").getInfo())
+print("AOI fraction colonized pre-2015:", frac_over_aoi(colonized_pre, "colonized_pre2015").getInfo())
+print("AOI fraction colonized post-2015:", frac_over_aoi(colonized_post, "colonized_post2015").getInfo())
+print(f"AOI fraction consolidated (maxrun>={CONSOLIDATION_CONSEC_YEARS}y):",
+      frac_over_aoi(consolidation_mask, f"macro_consolidation_ge{CONSOLIDATION_CONSEC_YEARS}y").getInfo())
+
+# -------------------------
+# (5) EXPORTS (GeoTIFF to Drive)
+# -------------------------
+export_geotiff(first_year, "MACRO_FIRST_YEAR_2005_2025", "macro_first_year_2005_2025")
+export_geotiff(last_year,  "MACRO_LAST_YEAR_2005_2025",  "macro_last_year_2005_2025")
+export_geotiff(freq_pct,   "MACRO_FREQUENCY_PCT_2005_2025", "macro_frequency_pct_2005_2025")
+export_geotiff(max_consecutive, "MACRO_MAX_CONSECUTIVE_2005_2025", "macro_max_consecutive_2005_2025")
+export_geotiff(colonized_pre,   "MACRO_COLONIZED_PRE2015",  "macro_colonized_pre2015")
+export_geotiff(colonized_post,  "MACRO_COLONIZED_POST2015", "macro_colonized_post2015")
+export_geotiff(consolidation_mask,
+               f"MACRO_CONSOLIDATION_MAXRUN_GE{CONSOLIDATION_CONSEC_YEARS}",
+               f"macro_consolidation_maxrun_ge{CONSOLIDATION_CONSEC_YEARS}y")
+
+print("\n✅ Tasks created. Go to Earth Engine 'Tasks' tab and click RUN.")
+print("📁 Drive folder:", EXPORT_FOLDER)
