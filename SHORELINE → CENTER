@@ -1,0 +1,270 @@
+# =========================================================
+# STEP D — SPATIAL EVOLUTION "SHORELINE → CENTER" (RING METRICS)
+# CORRIGIDO — COMPATÍVEL COM CLASSIFICADOR 3-CLASSES (5 FEATURES)
+#
+# Classes:
+#   0 = Água
+#   1 = Vegetação / Macrófitas
+#   2 = Sedimento
+#
+# Features obrigatórias (iguais ao treino):
+#   NDVI, MNDWI, BSI, NDMI, NBR2
+#
+# Requer no ambiente:
+#   - AOI      : ee.Geometry
+#   - landsat  : ImageCollection pré-processada com bandas BLUE,GREEN,RED,NIR,SWIR1,SWIR2
+#   - clf      : ee.Classifier treinado (RandomForest 3-class)
+#
+# Outputs:
+#   - macrophyte_rings_timeseries.csv
+#   - macrophyte_rings_state.json
+#   - macrophyte_rings_heatmap.png (opcional)
+# =========================================================
+
+import os, json
+import numpy as np
+import pandas as pd
+import ee
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+# -------------------------
+# HARD CHECKS
+# -------------------------
+if "AOI" not in globals():
+    raise NameError("AOI not found.")
+if "landsat" not in globals():
+    raise NameError("landsat ImageCollection not found.")
+if "clf" not in globals():
+    raise NameError("clf Classifier not found.")
+try:
+    ee.Number(1).getInfo()
+except Exception as e:
+    raise RuntimeError("Earth Engine not initialized.") from e
+
+# -------------------------
+# SETTINGS
+# -------------------------
+START_YEAR = 2005
+END_YEAR   = 2025
+EVENT_YEAR = 2015
+
+SCALE = 30
+MAX_PIX = 1e13
+MACRO_CLASS_VALUE = 1
+
+RING_WIDTH_M = 60
+N_RINGS_MAX  = 25
+GEOM_ERR_M  = 10  # obrigatório > 0
+
+OUT_DIR = "/content/results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+CSV_OUT   = f"{OUT_DIR}/macrophyte_rings_timeseries.csv"
+STATE_OUT = f"{OUT_DIR}/macrophyte_rings_state.json"
+PLOT_OUT  = f"{OUT_DIR}/macrophyte_rings_heatmap.png"
+
+# -------------------------
+# HELPERS
+# -------------------------
+def load_state(path):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {"done_years": []}
+
+def save_state(path, s):
+    with open(path, "w") as f:
+        json.dump(s, f, indent=2)
+
+def year_window(y):
+    return ee.Date.fromYMD(y,1,1), ee.Date.fromYMD(y+1,1,1)
+
+# -------------------------
+# ADD ALL REQUIRED INDICES (5 FEATURES)
+# -------------------------
+def add_indices_5bands(img):
+    ndvi  = img.normalizedDifference(["NIR","RED"]).rename("NDVI")
+    mndwi = img.normalizedDifference(["GREEN","SWIR1"]).rename("MNDWI")
+    ndmi  = img.normalizedDifference(["NIR","SWIR1"]).rename("NDMI")
+    nbr2  = img.normalizedDifference(["SWIR1","SWIR2"]).rename("NBR2")
+
+    bsi = img.expression(
+        "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))",
+        {
+            "SWIR1": img.select("SWIR1"),
+            "RED":   img.select("RED"),
+            "NIR":   img.select("NIR"),
+            "BLUE":  img.select("BLUE")
+        }
+    ).rename("BSI")
+
+    return img.addBands([ndvi, mndwi, bsi, ndmi, nbr2])
+
+# -------------------------
+# ANNUAL MACROPHYTE BINARY MAP
+# -------------------------
+def annual_macro_binary(y):
+    start, end = year_window(y)
+    col = landsat.filterDate(start, end)
+    n = col.size()
+
+    def _compute():
+        comp = col.median().clip(AOI)
+        comp = add_indices_5bands(comp)
+
+        pred = comp.select(
+            ["NDVI","MNDWI","BSI","NDMI","NBR2"]
+        ).classify(clf)
+
+        valid = comp.select("NDVI").mask()
+        macro = pred.eq(MACRO_CLASS_VALUE).And(valid)
+
+        return macro.updateMask(valid).rename("macro").set({
+            "year": y,
+            "n_images": n
+        })
+
+    empty = ee.Image(0).rename("macro").updateMask(ee.Image(0)).set({
+        "year": y,
+        "n_images": n
+    })
+
+    return ee.Image(ee.Algorithms.If(n.gt(0), _compute(), empty))
+
+# -------------------------
+# AREA CALCULATION
+# -------------------------
+def area_sums(mask_img, geom):
+    valid = mask_img.mask()
+    valid_area = ee.Image.pixelArea().updateMask(valid)
+    macro_area = ee.Image.pixelArea().updateMask(mask_img)
+
+    v = valid_area.reduceRegion(
+        ee.Reducer.sum(), geom, SCALE, maxPixels=MAX_PIX
+    ).get("area")
+
+    m = macro_area.reduceRegion(
+        ee.Reducer.sum(), geom, SCALE, maxPixels=MAX_PIX
+    ).get("area")
+
+    return v, m
+
+# -------------------------
+# BUILD RINGS (ROBUST)
+# -------------------------
+aoi_area = ee.Number(AOI.area(GEOM_ERR_M))
+approx_r = aoi_area.divide(np.pi).sqrt()
+max_inward = approx_r.multiply(0.9)
+
+n_rings = max_inward.divide(RING_WIDTH_M).floor().min(N_RINGS_MAX)
+n_rings = int(n_rings.getInfo())
+
+if n_rings < 3:
+    raise RuntimeError("AOI too small for ring analysis.")
+
+print(f"AOI area (m²): {aoi_area.getInfo():.0f}")
+print(f"Rings: {n_rings} | width = {RING_WIDTH_M} m")
+
+def safe_buffer(g, d):
+    return g.buffer(d, GEOM_ERR_M)
+
+rings = []
+for i in range(n_rings):
+    outer = safe_buffer(AOI, -i*RING_WIDTH_M)
+    inner = safe_buffer(AOI, -(i+1)*RING_WIDTH_M)
+    ring = outer.difference(inner, GEOM_ERR_M)
+    rings.append((i, ring, i*RING_WIDTH_M, (i+1)*RING_WIDTH_M))
+
+# Remove empty rings
+areas = [r[1].area(GEOM_ERR_M) for r in rings]
+areas = ee.List(areas).getInfo()
+
+rings = [r for r,a in zip(rings,areas) if a and a>0]
+print(f"Usable rings: {len(rings)}")
+
+# -------------------------
+# RESUME + CSV INIT
+# -------------------------
+state = load_state(STATE_OUT)
+done  = set(state.get("done_years", []))
+
+if os.path.exists(CSV_OUT):
+    df = pd.read_csv(CSV_OUT)
+else:
+    df = pd.DataFrame(columns=[
+        "year","ring_id","ring_m_from","ring_m_to",
+        "n_images","valid_area_m2","macro_area_m2","macro_pct_valid"
+    ])
+
+# -------------------------
+# PROCESS YEARS
+# -------------------------
+for y in range(START_YEAR, END_YEAR+1):
+    if y in done:
+        print(f"Year {y}: ✓ skipped")
+        continue
+
+    print(f"Year {y}: processing...", end=" ", flush=True)
+
+    img = annual_macro_binary(y)
+    n_images = int(img.get("n_images").getInfo())
+
+    rows = []
+    for rid, geom, r0, r1 in rings:
+        v, m = area_sums(img, geom)
+        info = ee.Dictionary({"v":v,"m":m}).getInfo()
+
+        v = info.get("v")
+        m = info.get("m")
+        pct = (100*m/v) if (v and m and v>0) else None
+
+        rows.append({
+            "year": y,
+            "ring_id": rid,
+            "ring_m_from": r0,
+            "ring_m_to": r1,
+            "n_images": n_images,
+            "valid_area_m2": v,
+            "macro_area_m2": m,
+            "macro_pct_valid": pct
+        })
+
+    df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+    df = df.drop_duplicates(subset=["year","ring_id"])
+    df.to_csv(CSV_OUT, index=False)
+
+    done.add(y)
+    state["done_years"] = sorted(list(done))
+    save_state(STATE_OUT, state)
+
+    outer = df[(df.year==y)&(df.ring_id==rings[0][0])]["macro_pct_valid"].values
+    inner = df[(df.year==y)&(df.ring_id==rings[-1][0])]["macro_pct_valid"].values
+    print(f"✓ n_imgs={n_images}, outer={outer[0]:.2f}% / inner={inner[0]:.2f}%")
+
+print(f"\n✅ Saved: {CSV_OUT}")
+print(f"✅ State: {STATE_OUT}")
+
+# -------------------------
+# HEATMAP (OPTIONAL)
+# -------------------------
+if plt is not None:
+    d = pd.read_csv(CSV_OUT)
+    mat = d.pivot(index="ring_id", columns="year", values="macro_pct_valid")
+
+    plt.figure(figsize=(14,6))
+    plt.imshow(mat, aspect="auto")
+    plt.colorbar(label="Macrophyte cover (%)")
+    plt.axvline(mat.columns.tolist().index(EVENT_YEAR), color="red", ls="--")
+    plt.yticks(
+        range(len(mat.index)),
+        [f"{int(r*RING_WIDTH_M)}–{int((r+1)*RING_WIDTH_M)} m" for r in mat.index]
+    )
+    plt.xticks(range(len(mat.columns)), mat.columns, rotation=90)
+    plt.title("Candonga — Shoreline → Center Macrophyte Evolution")
+    plt.tight_layout()
+    plt.savefig(PLOT_OUT, dpi=300)
+    print(f"✅ Heatmap saved: {PLOT_OUT}")
