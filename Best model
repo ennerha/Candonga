@@ -1,0 +1,440 @@
+# =========================================================
+# TREINAMENTO E VALIDAÇÃO DE CLASSIFICADORES - 3 CLASSES
+# Classes: 0=Água, 1=Vegetação/Macrófitas, 2=Sedimento
+# =========================================================
+
+import os, json
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import (
+    classification_report, 
+    confusion_matrix, 
+    accuracy_score,
+    f1_score,
+    cohen_kappa_score
+)
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+print("=" * 80)
+print("TREINAMENTO E VALIDAÇÃO DE CLASSIFICADORES - 3 CLASSES")
+print("=" * 80)
+
+# =========================================================================
+# CONFIGURAÇÕES
+# =========================================================================
+
+BASE_DIR = "/content/results"
+SAMPLES_FILE = f"{BASE_DIR}/training_samples_3class.csv"
+METRICS_FILE = f"{BASE_DIR}/classifiers_metrics_3class.csv"
+STATE_FILE   = f"{BASE_DIR}/classifier_state_3class.json"
+
+# Classes
+CLASS_NAMES = ["Água", "Vegetação", "Sedimento"]
+FEATURES = ["NDVI", "MNDWI", "BSI", "NDMI", "NBR2"]
+
+# Split
+TEST_SIZE = 0.30
+RANDOM_SEED = 42
+
+# =========================================================================
+# CARREGAR AMOSTRAS
+# =========================================================================
+
+print("\n" + "-" * 80)
+print("CARREGANDO AMOSTRAS DE TREINAMENTO")
+print("-" * 80)
+
+if not os.path.exists(SAMPLES_FILE):
+    raise FileNotFoundError(
+        f"Arquivo de amostras não encontrado: {SAMPLES_FILE}\n"
+        "Execute primeiro o script de amostragem automática."
+    )
+
+df = pd.read_csv(SAMPLES_FILE)
+print(f"✓ Carregadas {len(df)} amostras")
+
+# Verificar colunas
+required_cols = FEATURES + ["class"]
+missing = [col for col in required_cols if col not in df.columns]
+if missing:
+    raise ValueError(f"Colunas faltando: {missing}")
+
+# Limpar dados
+print("\nLimpando dados...")
+original_len = len(df)
+df = df.dropna(subset=required_cols).copy()
+if len(df) < original_len:
+    print(f"⚠ Removidas {original_len - len(df)} linhas com valores ausentes")
+
+# Verificar distribuição
+print("\n📊 Distribuição de classes:")
+for cls in sorted(df["class"].unique()):
+    count = len(df[df["class"] == cls])
+    pct = 100 * count / len(df)
+    print(f"   Classe {cls} ({CLASS_NAMES[cls]:12s}): {count:4d} ({pct:5.1f}%)")
+
+# =========================================================================
+# PREPARAR DADOS
+# =========================================================================
+
+print("\n" + "-" * 80)
+print("PREPARANDO DADOS PARA TREINAMENTO")
+print("-" * 80)
+
+X = df[FEATURES].values
+y = df["class"].values
+
+print(f"✓ Features: {', '.join(FEATURES)}")
+print(f"✓ Shape X: {X.shape}")
+print(f"✓ Shape y: {y.shape}")
+
+# Split estratificado (mantém proporção de classes)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_SEED,
+    stratify=y
+)
+
+print(f"\n✓ Conjunto de treino: {len(X_train)} amostras")
+print(f"✓ Conjunto de teste:  {len(X_test)} amostras")
+
+print("\nDistribuição no treino:")
+for cls in sorted(np.unique(y_train)):
+    count = np.sum(y_train == cls)
+    pct = 100 * count / len(y_train)
+    print(f"   {CLASS_NAMES[cls]:12s}: {count:4d} ({pct:5.1f}%)")
+
+print("\nDistribuição no teste:")
+for cls in sorted(np.unique(y_test)):
+    count = np.sum(y_test == cls)
+    pct = 100 * count / len(y_test)
+    print(f"   {CLASS_NAMES[cls]:12s}: {count:4d} ({pct:5.1f}%)")
+
+# =========================================================================
+# DEFINIR CLASSIFICADORES
+# =========================================================================
+
+print("\n" + "-" * 80)
+print("CONFIGURANDO CLASSIFICADORES")
+print("-" * 80)
+
+classifiers = {
+    "Random Forest": RandomForestClassifier(
+        n_estimators=200,
+        max_depth=20,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        random_state=RANDOM_SEED,
+        n_jobs=-1
+    ),
+    
+    "SVM (RBF)": SVC(
+        kernel='rbf',
+        C=10.0,
+        gamma='scale',
+        random_state=RANDOM_SEED
+    ),
+    
+    "Decision Tree (CART)": DecisionTreeClassifier(
+        max_depth=15,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        random_state=RANDOM_SEED
+    )
+}
+
+print(f"✓ {len(classifiers)} classificadores configurados:")
+for name in classifiers.keys():
+    print(f"   - {name}")
+
+# =========================================================================
+# TREINAR E AVALIAR CADA CLASSIFICADOR
+# =========================================================================
+
+print("\n" + "=" * 80)
+print("TREINAMENTO E VALIDAÇÃO")
+print("=" * 80)
+
+results = []
+
+for clf_name, clf in classifiers.items():
+    print(f"\n{'='*80}")
+    print(f"🔄 Treinando: {clf_name}")
+    print(f"{'='*80}")
+    
+    # Treinar
+    print("Treinando...")
+    clf.fit(X_train, y_train)
+    print("✓ Treinamento concluído")
+    
+    # Predição
+    print("Realizando predições no conjunto de teste...")
+    y_pred = clf.predict(X_test)
+    
+    # Métricas globais
+    accuracy = accuracy_score(y_test, y_pred)
+    f1_macro = f1_score(y_test, y_pred, average='macro')
+    f1_weighted = f1_score(y_test, y_pred, average='weighted')
+    kappa = cohen_kappa_score(y_test, y_pred)
+    
+    # Validação cruzada (5-fold)
+    print("Executando validação cruzada (5-fold)...")
+    cv_scores = cross_val_score(clf, X_train, y_train, cv=5, scoring='accuracy')
+    cv_mean = cv_scores.mean()
+    cv_std = cv_scores.std()
+    
+    print(f"\n📊 RESULTADOS - {clf_name}")
+    print("-" * 80)
+    print(f"Acurácia no teste:        {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"F1-Score (macro):         {f1_macro:.4f}")
+    print(f"F1-Score (weighted):      {f1_weighted:.4f}")
+    print(f"Kappa:                    {kappa:.4f}")
+    print(f"CV Acurácia (5-fold):     {cv_mean:.4f} ± {cv_std:.4f}")
+    
+    # Matriz de confusão
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"\n📈 Matriz de Confusão:")
+    print("\n           Predito →")
+    print(f"Real ↓     {CLASS_NAMES[0][:4]:>6s} {CLASS_NAMES[1][:4]:>6s} {CLASS_NAMES[2][:4]:>6s}")
+    for i, row in enumerate(cm):
+        print(f"{CLASS_NAMES[i]:11s} {row[0]:6d} {row[1]:6d} {row[2]:6d}")
+    
+    # Métricas por classe
+    print(f"\n📋 Relatório Detalhado:")
+    report = classification_report(y_test, y_pred, target_names=CLASS_NAMES, digits=4)
+    print(report)
+    
+    # Calcular Producer's e User's Accuracy por classe
+    print(f"\n🎯 Acurácias por Classe:")
+    for i, class_name in enumerate(CLASS_NAMES):
+        # Producer's Accuracy (recall)
+        producer = cm[i, i] / cm[i, :].sum() if cm[i, :].sum() > 0 else 0
+        # User's Accuracy (precision)
+        user = cm[i, i] / cm[:, i].sum() if cm[:, i].sum() > 0 else 0
+        
+        print(f"   {class_name:12s}:")
+        print(f"      Producer's Acc (Recall):    {producer:.4f} ({producer*100:.2f}%)")
+        print(f"      User's Acc (Precision):     {user:.4f} ({user*100:.2f}%)")
+    
+    # Salvar resultados
+    result = {
+        "Classificador": clf_name,
+        "Acuracia_Geral": accuracy,
+        "F1_Macro": f1_macro,
+        "F1_Weighted": f1_weighted,
+        "Kappa": kappa,
+        "CV_Mean": cv_mean,
+        "CV_Std": cv_std,
+        "N_Train": len(X_train),
+        "N_Test": len(X_test)
+    }
+    
+    # Adicionar métricas por classe
+    for i, class_name in enumerate(CLASS_NAMES):
+        producer = cm[i, i] / cm[i, :].sum() if cm[i, :].sum() > 0 else 0
+        user = cm[i, i] / cm[:, i].sum() if cm[:, i].sum() > 0 else 0
+        f1_class = f1_score(y_test == i, y_pred == i)
+        
+        result[f"Producer_{class_name}"] = producer
+        result[f"User_{class_name}"] = user
+        result[f"F1_{class_name}"] = f1_class
+    
+    results.append(result)
+    
+    # Salvar modelo
+    model_path = f"{BASE_DIR}/model_{clf_name.replace(' ', '_').replace('(', '').replace(')', '')}_3class.joblib"
+    joblib.dump(clf, model_path)
+    print(f"\n💾 Modelo salvo: {model_path}")
+
+# =========================================================================
+# RESUMO COMPARATIVO
+# =========================================================================
+
+print("\n" + "=" * 80)
+print("RESUMO COMPARATIVO DOS CLASSIFICADORES")
+print("=" * 80)
+
+results_df = pd.DataFrame(results)
+results_df.to_csv(METRICS_FILE, index=False)
+
+# Ordenar por F1-Score Macro
+results_df_sorted = results_df.sort_values("F1_Macro", ascending=False)
+
+print("\n🏆 Ranking por F1-Score (Macro):")
+print("-" * 80)
+print(f"{'Classificador':<20} {'Acurácia':>10} {'F1-Macro':>10} {'Kappa':>10} {'CV-Mean':>10}")
+print("-" * 80)
+for _, row in results_df_sorted.iterrows():
+    print(f"{row['Classificador']:<20} {row['Acuracia_Geral']:>10.4f} {row['F1_Macro']:>10.4f} {row['Kappa']:>10.4f} {row['CV_Mean']:>10.4f}")
+
+# Melhor modelo
+best_model_row = results_df_sorted.iloc[0]
+best_model_name = best_model_row["Classificador"]
+
+print(f"\n{'='*80}")
+print(f"🥇 MELHOR MODELO: {best_model_name}")
+print(f"{'='*80}")
+print(f"   Acurácia Geral:  {best_model_row['Acuracia_Geral']:.4f} ({best_model_row['Acuracia_Geral']*100:.2f}%)")
+print(f"   F1-Score Macro:  {best_model_row['F1_Macro']:.4f}")
+print(f"   Kappa:           {best_model_row['Kappa']:.4f}")
+print()
+print("   Performance por classe:")
+for class_name in CLASS_NAMES:
+    f1 = best_model_row[f"F1_{class_name}"]
+    producer = best_model_row[f"Producer_{class_name}"]
+    user = best_model_row[f"User_{class_name}"]
+    print(f"      {class_name:12s}: F1={f1:.4f}, Producer={producer:.4f}, User={user:.4f}")
+
+# =========================================================================
+# IMPORTÂNCIA DAS FEATURES (apenas para Random Forest)
+# =========================================================================
+
+if "Random Forest" in classifiers:
+    print(f"\n{'='*80}")
+    print("IMPORTÂNCIA DAS FEATURES (Random Forest)")
+    print(f"{'='*80}")
+    
+    rf_model = classifiers["Random Forest"]
+    importances = rf_model.feature_importances_
+    
+    # Ordenar por importância
+    indices = np.argsort(importances)[::-1]
+    
+    print("\nFeatures ordenadas por importância:")
+    for i, idx in enumerate(indices, 1):
+        bar = "█" * int(importances[idx] * 50)
+        print(f"   {i}. {FEATURES[idx]:8s}: {importances[idx]:.4f} {bar}")
+
+# =========================================================================
+# SALVAR O MELHOR MODELO SEPARADAMENTE
+# =========================================================================
+
+print(f"\n{'='*80}")
+print("SALVANDO MELHOR MODELO PARA APLICAÇÃO")
+print(f"{'='*80}")
+
+# Re-treinar o melhor modelo com TODOS os dados (opcional, mas recomendado)
+print(f"\n🔄 Re-treinando {best_model_name} com TODOS os dados...")
+best_classifier = classifiers[best_model_name]
+best_classifier.fit(X, y)  # Treinar com todos os dados (treino + teste)
+print("✓ Re-treinamento concluído")
+
+# Salvar o melhor modelo
+BEST_MODEL_PATH = f"{BASE_DIR}/BEST_MODEL_3class.joblib"
+joblib.dump(best_classifier, BEST_MODEL_PATH)
+print(f"\n💾 Melhor modelo salvo: {BEST_MODEL_PATH}")
+
+# Salvar também os metadados do melhor modelo
+best_model_info = {
+    "model_name": best_model_name,
+    "model_path": BEST_MODEL_PATH,
+    "trained_on_full_dataset": True,
+    "n_samples_total": len(X),
+    "accuracy": float(best_model_row['Acuracia_Geral']),
+    "f1_macro": float(best_model_row['F1_Macro']),
+    "kappa": float(best_model_row['Kappa']),
+    "features": FEATURES,
+    "classes": CLASS_NAMES,
+    "class_mapping": {i: name for i, name in enumerate(CLASS_NAMES)},
+    "training_date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+}
+
+BEST_MODEL_INFO_PATH = f"{BASE_DIR}/BEST_MODEL_INFO_3class.json"
+with open(BEST_MODEL_INFO_PATH, "w") as f:
+    json.dump(best_model_info, f, indent=2)
+
+print(f"💾 Info do melhor modelo: {BEST_MODEL_INFO_PATH}")
+
+# =========================================================================
+# SALVAR ESTADO GERAL
+# =========================================================================
+
+state = {
+    "best_model": best_model_name,
+    "best_model_path": BEST_MODEL_PATH,
+    "best_accuracy": float(best_model_row['Acuracia_Geral']),
+    "best_f1_macro": float(best_model_row['F1_Macro']),
+    "best_kappa": float(best_model_row['Kappa']),
+    "n_train": len(X_train),
+    "n_test": len(X_test),
+    "n_total": len(X),
+    "features": FEATURES,
+    "classes": CLASS_NAMES,
+    "test_size": TEST_SIZE,
+    "random_seed": RANDOM_SEED
+}
+
+with open(STATE_FILE, "w") as f:
+    json.dump(state, f, indent=2)
+
+print(f"\n💾 Métricas comparativas: {METRICS_FILE}")
+print(f"💾 Estado geral: {STATE_FILE}")
+
+# =========================================================================
+# RECOMENDAÇÕES
+# =========================================================================
+
+print("\n" + "=" * 80)
+print("RECOMENDAÇÕES PARA PRÓXIMAS ETAPAS")
+print("=" * 80)
+
+print(f"\n✅ MELHOR MODELO IDENTIFICADO E SALVO")
+print(f"   Modelo: {best_model_name}")
+print(f"   Arquivo: {BEST_MODEL_PATH}")
+print(f"   Info: {BEST_MODEL_INFO_PATH}")
+
+print("\n📋 Checklist de qualidade:")
+if best_model_row['Acuracia_Geral'] >= 0.85:
+    print("   ✓ Acurácia geral ≥ 85% - EXCELENTE")
+elif best_model_row['Acuracia_Geral'] >= 0.75:
+    print("   ⚠ Acurácia geral 75-85% - ACEITÁVEL")
+else:
+    print("   ❌ Acurácia geral < 75% - CONSIDERE MELHORAR")
+
+if best_model_row['Kappa'] >= 0.80:
+    print("   ✓ Kappa ≥ 0.80 - EXCELENTE concordância")
+elif best_model_row['Kappa'] >= 0.60:
+    print("   ⚠ Kappa 0.60-0.80 - BOA concordância")
+else:
+    print("   ❌ Kappa < 0.60 - CONSIDERE MELHORAR")
+
+# Verificar performance por classe
+print("\n   Performance por classe:")
+for class_name in CLASS_NAMES:
+    f1 = best_model_row[f"F1_{class_name}"]
+    if f1 >= 0.80:
+        status = "✓ EXCELENTE"
+    elif f1 >= 0.70:
+        status = "⚠ ACEITÁVEL"
+    else:
+        status = "❌ BAIXO - considere mais amostras"
+    print(f"      {class_name:12s}: F1={f1:.3f} {status}")
+
+print("\n" + "=" * 80)
+print("✅ TREINAMENTO E VALIDAÇÃO CONCLUÍDOS")
+print("=" * 80)
+
+print("\n📦 ARQUIVOS GERADOS:")
+print(f"   1. {BEST_MODEL_PATH}")
+print(f"      └─ Modelo pronto para classificação")
+print(f"   2. {BEST_MODEL_INFO_PATH}")
+print(f"      └─ Metadados do modelo")
+print(f"   3. {METRICS_FILE}")
+print(f"      └─ Comparação de todos os classificadores")
+print(f"   4. {STATE_FILE}")
+print(f"      └─ Estado geral do treinamento")
+
+print("\n🚀 PRÓXIMOS PASSOS:")
+print("   1. Revisar métricas acima")
+print("   2. Se satisfatório, usar o modelo para classificar imagens:")
+print(f"      modelo = joblib.load('{BEST_MODEL_PATH}')")
+print("   3. Aplicar nas imagens Landsat do período desejado")
+print("   4. Validar resultados visualmente")
+print("=" * 80)
